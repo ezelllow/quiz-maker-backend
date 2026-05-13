@@ -60,7 +60,12 @@ DB_CONFIG = {
     'user': os.getenv('DB_USER', 'root'),
     'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'quiz_maker'),
+    'port': int(os.getenv('DB_PORT', '3306')),
 }
+
+# Public base URL — used to build absolute image URLs returned to the frontend.
+# In dev: defaults to http://localhost:8000. In production set to your Render URL.
+PUBLIC_BASE_URL = os.getenv('PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')
 
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
@@ -73,10 +78,16 @@ def get_credentials():
     """
     Load credentials from environment or service account file.
 
-    Option 1: Set GOOGLE_APPLICATION_CREDENTIALS env variable to your service account JSON
-    Option 2: Place credentials.json in the same directory as this script
+    Option 1: Set GOOGLE_SERVICE_ACCOUNT_JSON env variable to the FULL JSON contents
+             (preferred for hosted deploys like Render — paste the file body).
+    Option 2: Set GOOGLE_APPLICATION_CREDENTIALS env variable to a JSON file path.
+    Option 3: Place credentials.json in the same directory as this script.
     """
-    if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+    inline_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if inline_json:
+        info = json.loads(inline_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    elif os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
         creds = Credentials.from_service_account_file(
             os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'),
             scopes=SCOPES
@@ -88,8 +99,9 @@ def get_credentials():
         )
     else:
         raise FileNotFoundError(
-            "Credentials not found! Set GOOGLE_APPLICATION_CREDENTIALS env variable "
-            "or place credentials.json in the script directory."
+            "Credentials not found! Set GOOGLE_SERVICE_ACCOUNT_JSON (preferred) or "
+            "GOOGLE_APPLICATION_CREDENTIALS env variable, or place credentials.json "
+            "in the script directory."
         )
     return creds
 
@@ -111,6 +123,7 @@ class Question(BaseModel):
     qno: str
     subtopic: str
     difficulty: str
+    level: Optional[str] = None  # Stream/Subject level
     question_text: str
     options: str
     answer: str
@@ -126,7 +139,9 @@ class Question(BaseModel):
 
 class QuizRequest(BaseModel):
     difficulty: Optional[str] = None
-    subtopic: Optional[str] = None
+    subtopic: Optional[str] = None  # Backwards-compat single subtopic
+    subtopics: Optional[List[str]] = None  # Up to 3 subtopics; questions distributed across them
+    level: Optional[str] = None  # Stream/Subject level
     count: int = 5
 
 class QuizResponse(BaseModel):
@@ -161,6 +176,43 @@ class UserProfile(BaseModel):
     email: str
     name: str
     created_at: str
+
+# ============================================================================
+# QUIZ HISTORY DATA MODELS
+# ============================================================================
+
+class QuizSubmissionRequest(BaseModel):
+    """Submit a completed quiz for scoring and history"""
+    difficulty: Optional[str] = None
+    subtopic: Optional[str] = None
+    level: Optional[str] = None
+    count: int
+    time_spent_seconds: int  # How long to complete the quiz
+    user_answers: Dict[int, str]  # {question_index: "answer"}
+    score: Optional[int] = None  # Score calculated by frontend (trusted)
+    percentage: Optional[int] = None  # Percentage calculated by frontend (trusted)
+    questions: Optional[List[Dict]] = None  # Full questions for verification and storage
+    parent_attempt_id: Optional[int] = None  # Set when this is a retake of a saved quiz
+    name: Optional[str] = None  # Quiz name; used for first attempt only (retakes inherit from parent)
+
+class QuizAttempt(BaseModel):
+    """A single quiz attempt record"""
+    id: int
+    user_id: int
+    difficulty: Optional[str]
+    subtopic: Optional[str]
+    score: int  # Number correct
+    percentage: int  # Score percentage
+    total_questions: int
+    time_spent_seconds: int
+    attempted_at: str
+    questions_data: Optional[dict] = None  # JSON of questions and answers for review
+
+class QuizHistoryResponse(BaseModel):
+    """History list response"""
+    attempts: List[QuizAttempt]
+    total_attempts: int
+    average_score: float
 
 # ============================================================================
 # OPTION TYPE PARSING
@@ -314,6 +366,83 @@ def get_db_connection():
     except Exception as e:
         print(f"❌ Database connection error: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
+
+def init_database():
+    """Initialize database tables if they don't exist"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Create users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255),
+                google_id VARCHAR(255),
+                name VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create quiz_attempts table for storing quiz history
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS quiz_attempts (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                name VARCHAR(255) NULL,
+                difficulty VARCHAR(50),
+                subtopic VARCHAR(255),
+                score INT,
+                percentage INT,
+                total_questions INT,
+                time_spent_seconds INT,
+                questions_data LONGTEXT,
+                parent_attempt_id INT NULL,
+                attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                INDEX idx_user_id (user_id),
+                INDEX idx_attempted_at (attempted_at),
+                INDEX idx_parent_attempt_id (parent_attempt_id)
+            )
+        """)
+
+        # Backfill the `name` column on pre-existing databases.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'quiz_attempts'
+              AND COLUMN_NAME = 'name'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                ALTER TABLE quiz_attempts
+                ADD COLUMN name VARCHAR(255) NULL AFTER user_id
+            """)
+            print("🔧 Added name column to quiz_attempts")
+
+        # Backfill the parent_attempt_id column on pre-existing databases that were
+        # created before this column existed. Safe to run every startup.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'quiz_attempts'
+              AND COLUMN_NAME = 'parent_attempt_id'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                ALTER TABLE quiz_attempts
+                ADD COLUMN parent_attempt_id INT NULL AFTER questions_data,
+                ADD INDEX idx_parent_attempt_id (parent_attempt_id)
+            """)
+            print("🔧 Added parent_attempt_id column to quiz_attempts")
+
+        conn.commit()
+        print("✅ Database tables initialized")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  Warning: Could not initialize database tables: {e}")
 
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
@@ -487,6 +616,7 @@ class QuestionCache:
                     qno = row[col_map['QNo']].strip()
                     subtopic = row[col_map[topic_col]].strip()
                     difficulty = row[col_map['Difficulty']].strip()
+                    level = row[col_map['Level']].strip() if 'Level' in col_map else None
                     question_text = row[col_map['Question']].strip()
                     options = row[col_map['Options']].strip()
                     answer = row[col_map['Answer']].strip()
@@ -530,6 +660,7 @@ class QuestionCache:
                         qno=qno,
                         subtopic=subtopic,
                         difficulty=difficulty,
+                        level=level,
                         question_text=question_text,
                         options=parsed_options,
                         answer=answer,
@@ -648,8 +779,21 @@ class QuestionCache:
 
         return sorted(list(difficulties))
 
+    def get_unique_levels(self) -> List[str]:
+        """Get all unique levels (streams/subjects)"""
+        if not self.is_loaded:
+            self.load_questions()
+
+        levels = set()
+        for q in self.questions:
+            if q.level:
+                levels.add(q.level)
+
+        return sorted(list(levels))
+
     def get_filtered_questions(self, difficulty: Optional[str] = None,
-                               subtopic: Optional[str] = None) -> List[Question]:
+                               subtopic: Optional[str] = None,
+                               level: Optional[str] = None) -> List[Question]:
         """Get questions filtered by difficulty and subtopic"""
         if not self.is_loaded:
             self.load_questions()
@@ -665,6 +809,10 @@ class QuestionCache:
         # Filter by subtopic
         if subtopic:
             filtered = [q for q in filtered if q.subtopic.lower() == subtopic.lower()]
+
+        # Filter by level (stream/subject)
+        if level:
+            filtered = [q for q in filtered if q.level and q.level.lower() == level.lower()]
 
         return filtered
 
@@ -738,10 +886,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware to allow requests from your React frontend
+# Add CORS middleware to allow requests from your React frontend.
+# Comma-separated list of allowed origins from CORS_ORIGINS env var.
+# In dev (no env set) we default to localhost:5173.
+_cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+print(f"🌐 CORS allowed origins: {ALLOWED_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend domain in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -792,6 +946,24 @@ async def get_difficulties():
         print(f"  ❌ Error in /api/difficulties: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/levels", response_model=List[str])
+async def get_levels():
+    """Get all available levels (streams/subjects)"""
+    try:
+        print(f"📌 /api/levels called. Cache loaded: {cache.is_loaded}, Questions count: {len(cache.questions)}")
+
+        # Ensure questions are loaded
+        if not cache.is_loaded:
+            print("  ⚠️  Cache not loaded, loading now...")
+            cache.load_questions()
+
+        levels = cache.get_unique_levels()
+        print(f"  ✅ Returning {len(levels)} levels: {levels}")
+        return levels
+    except Exception as e:
+        print(f"  ❌ Error in /api/levels: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/quiz", response_model=QuizResponse)
 async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
     """
@@ -820,27 +992,82 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
         if request.count < 1:
             raise HTTPException(status_code=400, detail="count must be at least 1")
 
-        # Get filtered questions
-        filtered_questions = cache.get_filtered_questions(
-            difficulty=request.difficulty,
-            subtopic=request.subtopic
-        )
+        # Normalize subtopics: combine the legacy `subtopic` field with the new
+        # `subtopics` list. De-duplicate while preserving order. Cap at 3.
+        topics = []
+        if request.subtopics:
+            topics = [s for s in request.subtopics if s and s.strip()]
+        if request.subtopic and request.subtopic.strip() and request.subtopic not in topics:
+            topics.append(request.subtopic)
+        topics = list(dict.fromkeys(topics))[:3]
 
-        # Check if we have enough questions
-        if not filtered_questions:
+        # Validate that we don't have more topics than questions
+        if len(topics) > request.count:
             raise HTTPException(
                 status_code=400,
-                detail=f"No questions found with difficulty='{request.difficulty}', subtopic='{request.subtopic}'"
+                detail=f"You picked {len(topics)} topics but only {request.count} question(s). "
+                       f"Reduce topics or increase question count."
             )
 
-        if len(filtered_questions) < request.count:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Only {len(filtered_questions)} questions available, but {request.count} requested"
-            )
+        # Build the question pool. With multiple topics, distribute count across
+        # them (random remainder allocation). With 0 or 1 topic, fall back to the
+        # original single-filter path.
+        if len(topics) > 1:
+            # Random distribution: start with floor allocation, then assign the
+            # remainder to randomly-chosen topics so no topic gets 0.
+            base, extra = divmod(request.count, len(topics))
+            allocations = {t: base for t in topics}
+            for t in random.sample(topics, extra):
+                allocations[t] += 1
+            # Ensure every topic has >= 1 (only matters if base==0; we already
+            # validated len(topics) <= count so this guarantees at least one).
+            for t in topics:
+                if allocations[t] == 0:
+                    allocations[t] = 1
 
-        # Randomly select count questions
-        selected_questions = random.sample(filtered_questions, request.count)
+            selected_questions = []
+            shortfall = []
+            for topic, n in allocations.items():
+                pool = cache.get_filtered_questions(
+                    difficulty=request.difficulty,
+                    subtopic=topic,
+                    level=request.level,
+                )
+                if len(pool) < n:
+                    shortfall.append(f"{topic} (need {n}, have {len(pool)})")
+                    continue
+                selected_questions.extend(random.sample(pool, n))
+
+            if shortfall:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Not enough questions for: {', '.join(shortfall)}"
+                )
+
+            # Trim/pad to exactly count (in case of rounding) and shuffle so
+            # questions of the same topic don't cluster.
+            selected_questions = selected_questions[:request.count]
+            random.shuffle(selected_questions)
+            filtered_questions = selected_questions  # for downstream code that uses it
+        else:
+            # Single topic (or none): original path
+            single_topic = topics[0] if topics else None
+            filtered_questions = cache.get_filtered_questions(
+                difficulty=request.difficulty,
+                subtopic=single_topic,
+                level=request.level,
+            )
+            if not filtered_questions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No questions found with difficulty='{request.difficulty}', subtopic='{single_topic}', level='{request.level}'"
+                )
+            if len(filtered_questions) < request.count:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Only {len(filtered_questions)} questions available, but {request.count} requested"
+                )
+            selected_questions = random.sample(filtered_questions, request.count)
 
         # Create deep copies of selected questions to avoid modifying cached originals
         from copy import deepcopy
@@ -879,7 +1106,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                 actual_file_id = cache.resolve_file_id(question.diagram_file_id)
                 if actual_file_id:
                     # Use backend image proxy endpoint
-                    question.setup_image_url = f"http://localhost:8000/api/image/{actual_file_id}"
+                    question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
                     print(f"  ✅ Setup diagram available (resolved to {actual_file_id[:20]}...)")
                 else:
                     print(f"  ⚠️  Could not resolve diagram file ID: {question.diagram_file_id}")
@@ -896,7 +1123,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                     options_file_id = cache.resolve_file_id(question.options_image_uid)
                     if options_file_id:
                         # Use backend image proxy endpoint
-                        question.image_url = f"http://localhost:8000/api/image/{options_file_id}"
+                        question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
                         print(f"  ✅ Options image found (resolved to {options_file_id[:20]}...)")
                     else:
                         print(f"  ⚠️  Options image not found - will show setup diagram instead")
@@ -1247,7 +1474,7 @@ async def google_login(request: GoogleLoginRequest):
 
 
 @app.get("/api/auth/me")
-async def get_user_profile(authorization: str = None):
+async def get_user_profile(authorization: str = Header(None)):
     """Get current user profile (requires token in Authorization header)"""
     try:
         # Get token from header
@@ -1301,27 +1528,578 @@ async def get_user_profile(authorization: str = None):
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
+# ============================================================================
+# QUIZ HISTORY ENDPOINTS
+# ============================================================================
+
+@app.post("/api/quiz/submit")
+async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Header(None)):
+    """Submit a completed quiz and save to history"""
+    try:
+        # Verify authentication
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+
+        token = authorization.replace("Bearer ", "")
+        payload = verify_jwt_token(token)
+
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        user_id = payload.get('user_id')
+
+        # Use frontend-provided score and questions if available (for retakes and accurate scoring)
+        if request.score is not None and request.percentage is not None:
+            score = request.score
+            percentage = request.percentage
+            print(f"✅ Using frontend-calculated score: {score}/{request.count} ({percentage}%)")
+        else:
+            # Fallback: calculate score from filtered questions (for backwards compatibility)
+            filtered_questions = cache.get_filtered_questions(
+                difficulty=request.difficulty,
+                subtopic=request.subtopic
+            )
+
+            if not filtered_questions or len(filtered_questions) < request.count:
+                raise HTTPException(status_code=400, detail="Could not retrieve quiz questions")
+
+            score = 0
+            for idx, user_answer in request.user_answers.items():
+                try:
+                    question_idx = int(idx)
+                    if question_idx < len(filtered_questions):
+                        question = filtered_questions[question_idx]
+                        correct_answer = question.answer.strip()
+                        if user_answer == correct_answer:
+                            score += 1
+                except (ValueError, IndexError):
+                    continue
+
+            percentage = round((score / request.count) * 100) if request.count > 0 else 0
+
+        # Save to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            import json
+
+            # Store full questions (with is_correct field) for retakes.
+            # The skinny `questions_review` shape used to be persisted here, but it
+            # stripped options/images and broke retakes — see get_quiz_for_retake().
+            if request.questions:
+                # Use frontend-provided questions with calculated correctness
+                full_questions_data = []
+                for idx, q in enumerate(request.questions):
+                    user_answer = request.user_answers.get(str(idx), "")
+                    correct_answer = q.get('answer', "").strip()
+                    is_correct = user_answer == correct_answer
+                    q_copy = q.copy()
+                    q_copy['is_correct'] = is_correct
+                    q_copy['user_answer'] = user_answer
+                    q_copy['correct_answer'] = correct_answer
+                    full_questions_data.append(q_copy)
+                full_questions_json = json.dumps(full_questions_data)
+                print(f"✅ Storing {len(full_questions_data)} questions from frontend with correctness")
+            else:
+                # Fallback: serialize filtered Question objects with correctness
+                filtered_questions = cache.get_filtered_questions(
+                    difficulty=request.difficulty,
+                    subtopic=request.subtopic
+                )
+                full_questions_data = []
+                for idx, q in enumerate(filtered_questions[:request.count]):  # Only store the count requested
+                    user_answer = request.user_answers.get(str(idx), "")
+                    correct_answer = q.answer.strip()
+                    is_correct = user_answer == correct_answer
+                    full_questions_data.append({
+                        'uid': q.uid,
+                        'qno': q.qno,
+                        'subtopic': q.subtopic,
+                        'difficulty': q.difficulty,
+                        'level': q.level,
+                        'question_text': q.question_text,
+                        'options': q.options,
+                        'answer': q.answer,
+                        'correct_answer': correct_answer,
+                        'user_answer': user_answer,
+                        'option_type': q.option_type,
+                        'table_headers': q.table_headers,
+                        'table_header_levels': q.table_header_levels,
+                        'table_header_colspan': q.table_header_colspan,
+                        'table_rows': q.table_rows,
+                        'diagram_file_id': q.diagram_file_id,
+                        'options_image_uid': q.options_image_uid,
+                        'image_url': q.image_url,
+                        'setup_image_url': q.setup_image_url,
+                        'is_correct': is_correct
+                    })
+                full_questions_json = json.dumps(full_questions_data)
+                print(f"✅ Storing {len(full_questions_data)} questions from filtered set with correctness")
+
+            # Resolve the parent attempt for retakes.
+            # If the request claims to be a retake of attempt X, walk up to the root
+            # original so all retakes of a saved quiz share the same parent_attempt_id.
+            # Also fetch the parent's name so the retake inherits it (frontend cannot
+            # rename a quiz at retake time — name lives on the original).
+            parent_attempt_id = None
+            inherited_name = None
+            if request.parent_attempt_id:
+                cursor.execute("""
+                    SELECT id, parent_attempt_id, name FROM quiz_attempts
+                    WHERE id = %s AND user_id = %s
+                """, (request.parent_attempt_id, user_id))
+                row = cursor.fetchone()
+                if row:
+                    parent_attempt_id = row[1] if row[1] else row[0]
+                    # If the referenced row is itself a retake, look up the root's name
+                    if row[1]:
+                        cursor.execute(
+                            "SELECT name FROM quiz_attempts WHERE id = %s AND user_id = %s",
+                            (row[1], user_id),
+                        )
+                        root = cursor.fetchone()
+                        inherited_name = root[0] if root else row[2]
+                    else:
+                        inherited_name = row[2]
+
+            # Decide the name to store on this row.
+            # Retakes inherit; originals use the request name or a sensible default.
+            if parent_attempt_id is not None:
+                quiz_name = inherited_name
+            else:
+                quiz_name = (request.name or "").strip() or None
+                if not quiz_name:
+                    parts = []
+                    if request.subtopic: parts.append(request.subtopic)
+                    if request.difficulty: parts.append(request.difficulty)
+                    parts.append(f"{request.count}Q")
+                    quiz_name = " · ".join(parts)
+
+            cursor.execute("""
+                INSERT INTO quiz_attempts
+                (user_id, name, difficulty, subtopic, score, percentage, total_questions,
+                 time_spent_seconds, questions_data, parent_attempt_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id,
+                quiz_name,
+                request.difficulty or None,
+                request.subtopic or None,
+                score,
+                percentage,
+                request.count,
+                request.time_spent_seconds,
+                full_questions_json,
+                parent_attempt_id,
+            ))
+            conn.commit()
+            attempt_id = cursor.lastrowid
+
+            kind = "retake" if parent_attempt_id else "saved quiz"
+            print(f"✅ Quiz attempt saved ({kind}): user={user_id}, score={score}/{request.count}, "
+                  f"time={request.time_spent_seconds}s, parent={parent_attempt_id}")
+
+            return {
+                'success': True,
+                'attempt_id': attempt_id,
+                'score': score,
+                'percentage': percentage,
+                'total_questions': request.count,
+                'message': f'Quiz saved! You scored {score}/{request.count} ({percentage}%)'
+            }
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error submitting quiz: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saving quiz: {str(e)}")
+
+
+@app.get("/api/history")
+async def get_quiz_history(
+    authorization: str = Header(None),
+    saved_only: bool = False,
+):
+    """Get quiz attempts for the current user.
+
+    Query params:
+      - saved_only (bool): If true, return only original "saved quizzes"
+        (attempts where parent_attempt_id IS NULL). Retakes are excluded.
+        Default false returns every attempt — used by the History tab.
+    """
+    try:
+        # Verify authentication
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+
+        token = authorization.replace("Bearer ", "")
+        payload = verify_jwt_token(token)
+
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        user_id = payload.get('user_id')
+
+        # Get quiz history from database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Get attempts (optionally filtered to originals only)
+            sql = """
+                SELECT id, name, difficulty, subtopic, score, percentage, total_questions,
+                       time_spent_seconds, attempted_at, parent_attempt_id
+                FROM quiz_attempts
+                WHERE user_id = %s
+            """
+            if saved_only:
+                sql += " AND parent_attempt_id IS NULL"
+            sql += " ORDER BY attempted_at DESC"
+
+            cursor.execute(sql, (user_id,))
+            attempts = cursor.fetchall()
+
+            # Build a lookup for parent rows so retakes can resolve their
+            # quiz name and a 1-based attempt number within the parent group.
+            cursor.execute(
+                "SELECT id, name FROM quiz_attempts WHERE user_id = %s AND parent_attempt_id IS NULL",
+                (user_id,),
+            )
+            parent_name_by_id = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Compute attempt_number per quiz group: oldest attempt = #1.
+            cursor.execute(
+                """
+                SELECT id, COALESCE(parent_attempt_id, id) AS root_id, attempted_at
+                FROM quiz_attempts
+                WHERE user_id = %s
+                ORDER BY COALESCE(parent_attempt_id, id), attempted_at ASC, id ASC
+                """,
+                (user_id,),
+            )
+            attempt_number_by_id = {}
+            attempt_count_by_root = {}
+            for row in cursor.fetchall():
+                aid, root_id, _ = row
+                attempt_count_by_root[root_id] = attempt_count_by_root.get(root_id, 0) + 1
+                attempt_number_by_id[aid] = attempt_count_by_root[root_id]
+
+            # Format results
+            history = []
+            total_score = 0
+
+            for attempt in attempts:
+                (attempt_id, name, difficulty, subtopic, score, percentage,
+                 total_q, time_spent, attempted_at, parent_attempt_id) = attempt
+                root_id = parent_attempt_id if parent_attempt_id else attempt_id
+                quiz_name = name or parent_name_by_id.get(root_id) or f"Quiz #{root_id}"
+                history.append({
+                    'id': attempt_id,
+                    'name': quiz_name,
+                    'difficulty': difficulty,
+                    'subtopic': subtopic,
+                    'score': score,
+                    'percentage': percentage,
+                    'total_questions': total_q,
+                    'time_spent_seconds': time_spent,
+                    'attempted_at': str(attempted_at),
+                    'parent_attempt_id': parent_attempt_id,
+                    'is_retake': parent_attempt_id is not None,
+                    'attempt_number': attempt_number_by_id.get(attempt_id, 1),
+                    'attempt_count': attempt_count_by_root.get(root_id, 1),
+                })
+                total_score += percentage or 0
+
+            average_score = round(total_score / len(attempts)) if attempts else 0
+
+            return {
+                'success': True,
+                'attempts': history,
+                'total_attempts': len(attempts),
+                'average_score': average_score
+            }
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching quiz history: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.get("/api/history/{attempt_id}")
+async def get_attempt_details(attempt_id: int, authorization: str = Header(None)):
+    """Get detailed review of a specific quiz attempt (shows wrong answers)"""
+    try:
+        # Verify authentication
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+
+        token = authorization.replace("Bearer ", "")
+        payload = verify_jwt_token(token)
+
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        user_id = payload.get('user_id')
+
+        # Get attempt from database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                SELECT id, difficulty, subtopic, score, percentage, total_questions,
+                       time_spent_seconds, questions_data, attempted_at
+                FROM quiz_attempts
+                WHERE id = %s AND user_id = %s
+            """, (attempt_id, user_id))
+
+            attempt = cursor.fetchone()
+
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Quiz attempt not found")
+
+            attempt_id, difficulty, subtopic, score, percentage, total_q, time_spent, questions_json, attempted_at = attempt
+
+            import json
+            questions_data = json.loads(questions_json) if questions_json else []
+
+            # Re-hydrate legacy skinny rows from the cache so review has options + images.
+            # Same logic as get_quiz_for_retake — see that endpoint for the full rationale.
+            if any(not q.get('options') and not q.get('table_rows') for q in questions_data):
+                if not cache.is_loaded:
+                    cache.load_questions()
+                by_qno = {q.qno: q for q in cache.questions if q.qno}
+                by_text = {q.question_text.strip(): q for q in cache.questions if q.question_text}
+
+                for i, q in enumerate(questions_data):
+                    if q.get('options') or q.get('table_rows'):
+                        continue
+                    full = (by_qno.get(q.get('qno'))
+                            or by_text.get((q.get('question_text') or '').strip()))
+                    if not full:
+                        continue
+                    questions_data[i] = {
+                        'qno': full.qno,
+                        'uid': full.uid,
+                        'subtopic': full.subtopic,
+                        'difficulty': full.difficulty,
+                        'level': full.level,
+                        'question_text': full.question_text,
+                        'options': full.options,
+                        'answer': full.answer,
+                        'option_type': full.option_type,
+                        'table_headers': full.table_headers,
+                        'table_header_levels': full.table_header_levels,
+                        'table_header_colspan': full.table_header_colspan,
+                        'table_rows': full.table_rows,
+                        'diagram_file_id': full.diagram_file_id,
+                        'options_image_uid': full.options_image_uid,
+                        'image_url': full.image_url,
+                        'setup_image_url': full.setup_image_url,
+                        'index': q.get('index', i),
+                        'user_answer': q.get('user_answer'),
+                        'correct_answer': q.get('correct_answer') or full.answer,
+                        'is_correct': q.get('is_correct', False),
+                    }
+
+            # Resolve diagram / options image file IDs to URLs
+            for q in questions_data:
+                if q.get('diagram_file_id'):
+                    actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                    if actual_file_id:
+                        q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
+
+                if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
+                    options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                    if options_file_id:
+                        q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
+                elif q.get('setup_image_url') and not q.get('image_url'):
+                    q['image_url'] = q['setup_image_url']
+
+            # Filter to show only wrong answers (safely handle missing is_correct field)
+            wrong_answers = [q for q in questions_data if not q.get('is_correct', False)]
+
+            return {
+                'success': True,
+                'attempt': {
+                    'id': attempt_id,
+                    'difficulty': difficulty,
+                    'subtopic': subtopic,
+                    'score': score,
+                    'percentage': percentage,
+                    'total_questions': total_q,
+                    'time_spent_seconds': time_spent,
+                    'attempted_at': str(attempted_at),
+                    'wrong_answers': wrong_answers,
+                    'wrong_count': len(wrong_answers)
+                }
+            }
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching attempt details: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+
+@app.get("/api/history/{attempt_id}/quiz")
+async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)):
+    """Get the full quiz questions from a previous attempt for retaking"""
+    try:
+        # Verify authentication
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+
+        token = authorization.replace("Bearer ", "")
+        payload = verify_jwt_token(token)
+
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        user_id = payload.get('user_id')
+
+        # Get quiz from database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                SELECT id, difficulty, subtopic, score, percentage, total_questions,
+                       time_spent_seconds, questions_data, attempted_at
+                FROM quiz_attempts
+                WHERE id = %s AND user_id = %s
+            """, (attempt_id, user_id))
+
+            attempt = cursor.fetchone()
+
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Quiz attempt not found")
+
+            attempt_id, difficulty, subtopic, score, percentage, total_q, time_spent, questions_json, attempted_at = attempt
+
+            import json
+            questions_data = json.loads(questions_json) if questions_json else []
+
+            # Re-hydrate legacy "skinny" rows that lack full question fields.
+            # Older versions of /api/quiz/submit stored only the review shape:
+            #   {index, question_text, user_answer, correct_answer, is_correct, subtopic, difficulty}
+            # so options / option_type / table_rows / image refs were never persisted.
+            # On retake we look the row up in the in-memory question cache and merge
+            # the full fields back in, preserving the attempt-specific answer data.
+            if any(not q.get('options') and not q.get('table_rows') for q in questions_data):
+                if not cache.is_loaded:
+                    cache.load_questions()
+                by_qno = {q.qno: q for q in cache.questions if q.qno}
+                by_text = {q.question_text.strip(): q for q in cache.questions if q.question_text}
+
+                for i, q in enumerate(questions_data):
+                    if q.get('options') or q.get('table_rows'):
+                        continue  # already full
+                    full = (by_qno.get(q.get('qno'))
+                            or by_text.get((q.get('question_text') or '').strip()))
+                    if not full:
+                        print(f"⚠️  Could not rehydrate question {i}: no cache match for "
+                              f"qno={q.get('qno')!r} text={(q.get('question_text') or '')[:60]!r}")
+                        continue
+                    questions_data[i] = {
+                        'qno': full.qno,
+                        'uid': full.uid,
+                        'subtopic': full.subtopic,
+                        'difficulty': full.difficulty,
+                        'level': full.level,
+                        'question_text': full.question_text,
+                        'options': full.options,
+                        'answer': full.answer,
+                        'option_type': full.option_type,
+                        'table_headers': full.table_headers,
+                        'table_header_levels': full.table_header_levels,
+                        'table_header_colspan': full.table_header_colspan,
+                        'table_rows': full.table_rows,
+                        'diagram_file_id': full.diagram_file_id,
+                        'options_image_uid': full.options_image_uid,
+                        'image_url': full.image_url,
+                        'setup_image_url': full.setup_image_url,
+                        # preserve attempt-specific fields from the saved row
+                        'user_answer': q.get('user_answer'),
+                        'correct_answer': q.get('correct_answer') or full.answer,
+                        'is_correct': q.get('is_correct', False),
+                    }
+
+            # Set image URLs for questions
+            for q in questions_data:
+                if q.get('diagram_file_id'):
+                    actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                    if actual_file_id:
+                        q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
+
+                if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
+                    options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                    if options_file_id:
+                        q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
+                elif q.get('setup_image_url'):
+                    q['image_url'] = q['setup_image_url']
+
+            return {
+                'success': True,
+                'questions': questions_data,
+                'count': len(questions_data),
+                'filters': {
+                    'difficulty': difficulty,
+                    'subtopic': subtopic,
+                    'level': None
+                },
+                'original_attempt': {
+                    'score': score,
+                    'percentage': percentage,
+                    'attempted_at': str(attempted_at)
+                }
+            }
+
+        finally:
+            cursor.close()
+            conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching quiz for retake: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load questions and pre-cache files on startup"""
     try:
         print("🚀 Starting up...")
+        print("💾 Initializing database...")
+        init_database()
         print("📁 Pre-loading file map...")
         cache.load_file_map()
-
         print("📋 Loading questions...")
         cache.load_questions()
         print(f"📊 Available subtopics: {cache.get_unique_subtopics()}")
         print(f"📊 Available difficulties: {cache.get_unique_difficulties()}")
 
-        # Show category statistics on startup
         stats = get_category_statistics()
         print("\n📊 Question Categories:")
         for qtype, data in stats.items():
             print(f"  {qtype}: {data['count']} questions ({data['percentage']}%)")
-
         print("\n✅ Startup complete!")
-
     except Exception as e:
         print(f"❌ Failed during startup: {e}")
 
@@ -1336,5 +2114,4 @@ if __name__ == "__main__":
     print(f"📁 Drive Folder ID: {QUESTION_FOLDER_ID}")
     print("\n💡 API will be available at http://localhost:8000")
     print("📖 Docs at http://localhost:8000/docs\n")
-
     uvicorn.run(app, host="0.0.0.0", port=8000)

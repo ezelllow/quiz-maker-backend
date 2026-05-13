@@ -1,0 +1,26 @@
+# Render Blueprint — auto-creates the web service when you connect this repo.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: quiz-backend
+    runtime: python
+    region: singapore
+    plan: starter            # $7/mo, no cold starts
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn quiz_backend:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # ---- Set the rest of these in the Render dashboard ----
+      # - key: DB_HOST           value: <from Railway>
+      # - key: DB_PORT           value: <from Railway>
+      # - key: DB_USER           value: <from Railway>
+      # - key: DB_PASSWORD       value: <from Railway>
+      # - key: DB_NAME           value: <from Railway>
+      # - key: JWT_SECRET        generateValue: true
+      # - key: GOOGLE_CLIENT_ID
+      # - key: GOOGLE_CLIENT_SECRET
+      # - key: GOOGLE_SERVICE_ACCOUNT_JSON   # paste full JSON of your service account
+      # - key: PUBLIC_BASE_URL   value: https://<this-service>.onrender.com
+      # - key: CORS_ORIGINS      value: https://<your-frontend>.pages.dev
