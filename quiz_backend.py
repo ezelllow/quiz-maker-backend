@@ -2081,6 +2081,160 @@ async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
+@app.get("/api/stats")
+async def get_user_stats(authorization: str = Header(None)):
+    """Aggregated statistics for the current user: overall accuracy,
+    performance trend, per-subtopic + per-difficulty breakdown,
+    weakest topics."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT id, difficulty, subtopic, score, percentage, total_questions,
+                       time_spent_seconds, questions_data, attempted_at, parent_attempt_id
+                FROM quiz_attempts
+                WHERE user_id = %s
+                ORDER BY attempted_at ASC
+                """,
+                (user_id,),
+            )
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+        if not rows:
+            return {
+                "total_attempts": 0,
+                "total_quizzes": 0,
+                "total_questions_answered": 0,
+                "total_correct": 0,
+                "overall_accuracy": 0,
+                "total_time_seconds": 0,
+                "avg_time_per_question": 0,
+                "trend": [],
+                "by_subtopic": [],
+                "by_difficulty": [],
+                "weakest_subtopics": [],
+                "recent_streak_days": 0,
+            }
+
+        import json as _json
+        total_attempts = len(rows)
+        unique_quizzes = len({r[9] if r[9] else r[0] for r in rows})
+        total_questions = sum(int(r[5] or 0) for r in rows)
+        total_correct = sum(int(r[3] or 0) for r in rows)
+        total_time = sum(int(r[6] or 0) for r in rows)
+        overall_acc = round(100 * total_correct / total_questions, 1) if total_questions else 0
+
+        trend = [
+            {
+                "attempted_at": str(r[8]),
+                "percentage": int(r[4] or 0),
+                "score": int(r[3] or 0),
+                "total": int(r[5] or 0),
+                "subtopic": r[2],
+                "difficulty": r[1],
+            }
+            for r in rows[-15:]
+        ]
+
+        subtopic_agg = {}
+        difficulty_agg = {}
+        for r in rows:
+            attempt_diff = r[1] or "Unknown"
+            attempt_subtopic = r[2] or "Mixed"
+            qjson = r[7]
+            try:
+                questions = _json.loads(qjson) if qjson else []
+            except Exception:
+                questions = []
+            if questions:
+                for q in questions:
+                    if not isinstance(q, dict):
+                        continue
+                    is_correct = bool(q.get("is_correct"))
+                    sub = q.get("subtopic") or attempt_subtopic or "Mixed"
+                    diff = q.get("difficulty") or attempt_diff or "Unknown"
+                    subtopic_agg.setdefault(sub, [0, 0])
+                    subtopic_agg[sub][0] += int(is_correct)
+                    subtopic_agg[sub][1] += 1
+                    difficulty_agg.setdefault(diff, [0, 0])
+                    difficulty_agg[diff][0] += int(is_correct)
+                    difficulty_agg[diff][1] += 1
+            else:
+                subtopic_agg.setdefault(attempt_subtopic, [0, 0])
+                subtopic_agg[attempt_subtopic][0] += int(r[3] or 0)
+                subtopic_agg[attempt_subtopic][1] += int(r[5] or 0)
+                difficulty_agg.setdefault(attempt_diff, [0, 0])
+                difficulty_agg[attempt_diff][0] += int(r[3] or 0)
+                difficulty_agg[attempt_diff][1] += int(r[5] or 0)
+
+        def shape(agg):
+            return sorted(
+                [
+                    {
+                        "name": k,
+                        "correct": v[0],
+                        "total": v[1],
+                        "accuracy": round(100 * v[0] / v[1], 1) if v[1] else 0,
+                    }
+                    for k, v in agg.items()
+                ],
+                key=lambda x: x["name"].lower(),
+            )
+
+        by_subtopic = shape(subtopic_agg)
+        by_difficulty = shape(difficulty_agg)
+        weakest = sorted(
+            [s for s in by_subtopic if s["total"] >= 3],
+            key=lambda s: s["accuracy"],
+        )[:3]
+
+        from datetime import date, timedelta
+        attempt_dates = set()
+        for r in rows:
+            try:
+                attempt_dates.add(r[8].date() if hasattr(r[8], "date") else None)
+            except Exception:
+                pass
+        attempt_dates.discard(None)
+        streak = 0
+        d = date.today()
+        while d in attempt_dates:
+            streak += 1
+            d -= timedelta(days=1)
+
+        return {
+            "total_attempts": total_attempts,
+            "total_quizzes": unique_quizzes,
+            "total_questions_answered": total_questions,
+            "total_correct": total_correct,
+            "overall_accuracy": overall_acc,
+            "total_time_seconds": total_time,
+            "avg_time_per_question": round(total_time / total_questions, 1) if total_questions else 0,
+            "trend": trend,
+            "by_subtopic": by_subtopic,
+            "by_difficulty": by_difficulty,
+            "weakest_subtopics": weakest,
+            "recent_streak_days": streak,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error computing stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load questions and pre-cache files on startup"""
@@ -2094,7 +2248,6 @@ async def startup_event():
         cache.load_questions()
         print(f"📊 Available subtopics: {cache.get_unique_subtopics()}")
         print(f"📊 Available difficulties: {cache.get_unique_difficulties()}")
-
         stats = get_category_statistics()
         print("\n📊 Question Categories:")
         for qtype, data in stats.items():
