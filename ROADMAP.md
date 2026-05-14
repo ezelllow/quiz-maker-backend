@@ -49,25 +49,39 @@ Tags: **[BUILT]**, **[TODO]**.
 
 ## TIER 2 — The gamification engine (Phase 2 — GATED, see below)
 
-**T2.1 — `streaks` + `rank_history` tables.** **[TODO]**
+> Built on 2026-05-13 after Lloyd's explicit override of the gate below.
 
-**T2.2 — Daily Challenge.** System-generated 10-question quiz, weak-topic weighted, difficulty centred on the user's rank. Endpoints: `GET /api/daily-challenge`, `POST /api/daily-challenge/submit`. **[TODO]**
+**T2.1 — `streaks`, `rank_history`, `daily_challenges` tables.** **[BUILT]**
 
-**T2.3 — Streak logic.** ≥60% floor to qualify, same-day retries allowed, 1 freeze per 7 days. Endpoint: `GET /api/streak`. **[TODO]**
+**T2.2 — Daily Challenge.** System-generated 10-question quiz, weak-topic weighted. Endpoints: `GET /api/daily-challenge`, `POST /api/daily-challenge/submit`. **[BUILT]** *(difficulty-centring on rank deferred — v1 does weak-topic weighting + mixed difficulty)*
 
-**T2.4 — Rank movement.** Wire promote (3-of-5) / demote (4-of-5) / fresh-window rule to Daily Challenge submissions. Only Daily Challenges move rank. **[TODO]**
+**T2.3 — Streak logic.** Same-day retries, 1 freeze per 7 days, lazy expiry on read. Endpoint: `GET /api/streak`. **[BUILT]** *(2026-05-14: flat 60% floor replaced with a rank-relative floor — band two ranks below the student's, F9 = 35%.)*
 
-**T2.5 — Daily Challenge UI + streak display + rank-up moment.** **[TODO]**
+**T2.4 — Rank movement.** ~~Promote (3-of-5) / demote (4-of-5) wired to Daily Challenge submissions.~~ **[REVERTED 2026-05-14]** — unwired because it made the Daily Challenge drive both streak and rank. Rank now holds at the placement band; movement is deferred to a separate periodic Rank Assessment (see T5.1 and `PHASE0_SPEC.md` §4). The temporary `/api/test/daily-rank` endpoint + `TestPanel.jsx` were removed with it.
+
+**T2.5 — Daily Challenge UI + streak display + rank-up moment.** `DailyChallenge.jsx` page, "🔥 Daily" nav item, streak card on the Dashboard, rank-change banner in the result screen. **[BUILT]** *(rank-change banner is dormant after T2.4 was reverted — it degrades gracefully since `rank.changed` is always false.)*
 
 ---
 
 ## TIER 3 — Practice growth view + legibility
 
-**T3.1 — `quiz_type` filter on `/api/stats`** so the Practice growth view isn't polluted by Daily Challenge scores. **[TODO]**
+> Built on 2026-05-14 after Lloyd's second explicit override of the build gate.
 
-**T3.2 — Practice growth view.** Per-topic accuracy trend, "topics improved" count, week-on-week accuracy delta. Lead with *improvement*, not volume. Fold into the existing Dashboard tab. **[TODO]**
+**T3.1 — `quiz_type` filter on `/api/stats`** so the Practice growth view isn't polluted by Daily Challenge scores. `WHERE quiz_type = 'practice'` added to the stats query. **[BUILT]**
 
-**T3.3 — Legibility copy.** UI text connecting Practice → Daily Challenge ("Drill your weak topics to ace tomorrow's Daily Challenge"). Near-zero effort, makes Practice's incentive visible. **[TODO]**
+**T3.2 — Practice growth view.** Per-topic accuracy trend (earlier vs recent half), "topics improved" count, week-on-week accuracy delta. `growth` object added to `/api/stats`; `GrowthPanel` folded into the Dashboard, leads with improvement. **[BUILT]**
+
+**T3.3 — Legibility copy.** Practice→Daily hint in the Growth panel; Daily→Practice hint on the Daily Challenge intro screen. **[BUILT]**
+
+---
+
+## TIER 5 — Rank rework (separate rank from the Daily Challenge)
+
+> Spec'd 2026-05-14. Build-gated — do not build until HabitGo is deployed with a real cohort.
+
+**T5.1 — Periodic Rank Assessment.** A separate system-generated assessment that reuses the placement infrastructure (stratified draw, `score_to_band()`). Runs on its own cadence (monthly, or on-demand with a cooldown — TBD). The *only* thing that moves rank. Daily Challenge → streak only; Practice → neither. Spec in `PHASE0_SPEC.md` §4. **[SPEC — not built]**
+
+**T5.2 — Rank tier names + icons.** Student-facing tier name + emoji icon per band (🌱 Beginner → 👑 Legend). The O-Level letter codes (A1–F9) are kept as the internal data model but **never shown to students** — every rank display is icon + tier name. Appears in the navbar badge, Settings, Dashboard, Daily Challenge intro, and the placement result. **[BUILT 2026-05-14]**
 
 ---
 

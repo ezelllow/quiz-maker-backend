@@ -466,6 +466,56 @@ def init_database():
             """)
             print("🔧 Added quiz_type column to quiz_attempts")
 
+        # Create streaks table (Phase 2 — one row per user, global daily streak)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS streaks (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                current_streak INT DEFAULT 0,
+                longest_streak INT DEFAULT 0,
+                last_qualified_date DATE NULL,
+                freezes_available INT DEFAULT 1,
+                freeze_last_granted DATE NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uniq_streak_user (user_id)
+            )
+        """)
+
+        # Create rank_history table (Phase 2 — append a row on every rank change)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rank_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                subject VARCHAR(100) NOT NULL,
+                rank_band VARCHAR(4) NOT NULL,
+                rank_score INT NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                INDEX idx_rh_user_subject (user_id, subject)
+            )
+        """)
+
+        # Create daily_challenges table (Phase 2 — one row per user+subject+day)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_challenges (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                subject VARCHAR(100) NOT NULL,
+                challenge_date DATE NOT NULL,
+                score INT NOT NULL,
+                total INT NOT NULL,
+                percentage INT NOT NULL,
+                passed BOOLEAN DEFAULT FALSE,
+                attempts INT DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uniq_dc_user_subject_date (user_id, subject, challenge_date),
+                INDEX idx_dc_user_subject (user_id, subject)
+            )
+        """)
+
         # Create user_subject_ranks table (Phase 1 ranking system)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_subject_ranks (
@@ -2246,7 +2296,7 @@ async def get_user_stats(authorization: str = Header(None)):
                 SELECT id, difficulty, subtopic, score, percentage, total_questions,
                        time_spent_seconds, questions_data, attempted_at, parent_attempt_id
                 FROM quiz_attempts
-                WHERE user_id = %s
+                WHERE user_id = %s AND quiz_type = 'practice'
                 ORDER BY attempted_at ASC
                 """,
                 (user_id,),
@@ -2270,6 +2320,11 @@ async def get_user_stats(authorization: str = Header(None)):
                 "by_difficulty": [],
                 "weakest_subtopics": [],
                 "recent_streak_days": 0,
+                "growth": {
+                    "this_week_accuracy": 0, "last_week_accuracy": 0,
+                    "accuracy_delta": None, "topics_improved": 0,
+                    "topics_tracked": 0, "per_topic_trend": [],
+                },
             }
 
         import json as _json
@@ -2344,7 +2399,7 @@ async def get_user_stats(authorization: str = Header(None)):
             key=lambda s: s["accuracy"],
         )[:3]
 
-        from datetime import date, timedelta
+        from datetime import date, timedelta, datetime
         attempt_dates = set()
         for r in rows:
             try:
@@ -2357,6 +2412,80 @@ async def get_user_stats(authorization: str = Header(None)):
         while d in attempt_dates:
             streak += 1
             d -= timedelta(days=1)
+
+        # ---- T3.2: Practice growth metrics (improvement-led, practice-only) ----
+        now_dt = datetime.now()
+        topic_series = {}   # topic -> [is_correct, ...] in chronological order
+        wk_recent = [0, 0]  # [correct, total] for attempts < 7 days old
+        wk_prev = [0, 0]    # [correct, total] for attempts 7-14 days old
+        for r in rows:
+            ts = r[8]
+            try:
+                age_days = (now_dt - ts).days if ts is not None else None
+            except Exception:
+                age_days = None
+            qjson = r[7]
+            try:
+                questions = _json.loads(qjson) if qjson else []
+            except Exception:
+                questions = []
+            valid_qs = [q for q in questions if isinstance(q, dict)] if questions else []
+            if valid_qs:
+                for q in valid_qs:
+                    ic = int(bool(q.get("is_correct")))
+                    sub = q.get("subtopic") or (r[2] or "Mixed")
+                    topic_series.setdefault(sub, []).append(ic)
+                    if age_days is not None and age_days < 7:
+                        wk_recent[0] += ic; wk_recent[1] += 1
+                    elif age_days is not None and age_days < 14:
+                        wk_prev[0] += ic; wk_prev[1] += 1
+            else:
+                # legacy skinny row: only attempt-level totals available
+                c, t = int(r[3] or 0), int(r[5] or 0)
+                if age_days is not None and age_days < 7:
+                    wk_recent[0] += c; wk_recent[1] += t
+                elif age_days is not None and age_days < 14:
+                    wk_prev[0] += c; wk_prev[1] += t
+
+        def _acc(pair):
+            return round(100 * pair[0] / pair[1], 1) if pair[1] else 0.0
+
+        this_week_acc = _acc(wk_recent)
+        last_week_acc = _acc(wk_prev)
+        accuracy_delta = (round(this_week_acc - last_week_acc, 1)
+                          if (wk_recent[1] and wk_prev[1]) else None)
+
+        per_topic_trend = []
+        topics_improved = 0
+        for sub, series in topic_series.items():
+            n = len(series)
+            if n < 4:
+                continue  # not enough history to call a trend
+            half = n // 2
+            earlier = series[:half]
+            recent = series[half:]
+            e_acc = round(100 * sum(earlier) / len(earlier), 1)
+            r_acc = round(100 * sum(recent) / len(recent), 1)
+            delta = round(r_acc - e_acc, 1)
+            if delta > 0:
+                topics_improved += 1
+            per_topic_trend.append({
+                "name": sub,
+                "earlier_accuracy": e_acc,
+                "recent_accuracy": r_acc,
+                "delta": delta,
+                "questions": n,
+            })
+        per_topic_trend.sort(key=lambda x: x["delta"], reverse=True)
+
+        growth = {
+            "this_week_accuracy": this_week_acc,
+            "last_week_accuracy": last_week_acc,
+            "accuracy_delta": accuracy_delta,
+            "topics_improved": topics_improved,
+            "topics_tracked": len(per_topic_trend),
+            "per_topic_trend": per_topic_trend,
+        }
 
         return {
             "total_attempts": total_attempts,
@@ -2371,6 +2500,7 @@ async def get_user_stats(authorization: str = Header(None)):
             "by_difficulty": by_difficulty,
             "weakest_subtopics": weakest,
             "recent_streak_days": streak,
+            "growth": growth,
         }
     except HTTPException:
         raise
@@ -2547,6 +2677,9 @@ async def submit_placement(request: PlacementSubmitRequest, authorization: str =
             "total": request.total,
             "percentage": percentage,
             "rank_band": band,
+            "tier_name": RANK_TIER_NAMES.get(band, ""),
+            "tier_desc": RANK_TIER_DESC.get(band, ""),
+            "tier_icon": RANK_TIER_ICONS.get(band, ""),
         }
     except HTTPException:
         raise
@@ -2588,6 +2721,9 @@ async def get_user_ranks(authorization: str = Header(None)):
                 "subject": r[0],
                 "rank_band": r[1],
                 "rank_score": r[2],
+                "tier_name": RANK_TIER_NAMES.get(r[1], ""),
+                "tier_desc": RANK_TIER_DESC.get(r[1], ""),
+                "tier_icon": RANK_TIER_ICONS.get(r[1], ""),
                 "placed_at": str(r[3]),
                 "updated_at": str(r[4]),
             }
@@ -2598,6 +2734,419 @@ async def get_user_ranks(authorization: str = Header(None)):
         raise
     except Exception as e:
         print(f"\u274c Error in /api/ranks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# PHASE 2: DAILY CHALLENGE, STREAK & RANK MOVEMENT
+# ============================================================================
+
+# Band order, worst -> best. Index in this list == rank strength.
+RANK_BANDS = ["F9", "E8", "D7", "C6", "C5", "B4", "B3", "A2", "A1"]
+BAND_FLOOR = {"A1": 75, "A2": 70, "B3": 65, "B4": 60, "C5": 55,
+              "C6": 50, "D7": 45, "E8": 40, "F9": 35}
+STREAK_FLOOR = 60          # fallback floor only (used if a user has no rank yet)
+DAILY_CHALLENGE_LEN = 10   # questions per Daily Challenge
+
+# Student-facing tier name + description for each O-Level band (worst -> best).
+RANK_TIER_NAMES = {
+    "F9": "Beginner", "E8": "Apprentice", "D7": "Advanced",
+    "C6": "Scholar", "C5": "Expert", "B4": "Elite",
+    "B3": "Master", "A2": "Champion", "A1": "Legend",
+}
+RANK_TIER_DESC = {
+    "F9": "Very weak foundation. Struggles with basic concepts and lacks confidence "
+          "in answering questions independently. Still building core understanding.",
+    "E8": "Developing foundational knowledge across topics. Can apply basic methods "
+          "but struggles with unfamiliar or multi-step questions.",
+    "D7": "Above-average understanding with decent problem-solving ability. Can handle "
+          "intermediate difficulty questions independently.",
+    "C6": "Strong grasp of concepts and reliable performance across most topics. Makes "
+          "fewer careless mistakes and thinks more analytically.",
+    "C5": "Demonstrates solid conceptual mastery and good application skills. "
+          "Comfortable with challenging questions and complex problem-solving.",
+    "B4": "High-performing student with strong accuracy, speed, and consistency. "
+          "Understands deeper patterns and advanced techniques well.",
+    "B3": "Exceptional understanding and strong critical thinking ability. Performs "
+          "confidently even under pressure and rarely struggles with difficult questions.",
+    "A2": "Near top-tier mastery. Highly consistent, efficient, and capable of solving "
+          "advanced questions with precision and confidence.",
+    "A1": "Outstanding academic mastery with elite-level understanding, accuracy, and "
+          "problem-solving ability. Performs at the highest level consistently.",
+}
+# Academic-journey icon set (sprout -> crown). One dict — swap freely.
+RANK_TIER_ICONS = {
+    "F9": "\U0001F331", "E8": "\U0001F530", "D7": "\U0001F4D8",
+    "C6": "\U0001F393", "C5": "\U0001F9E0", "B4": "\u26A1",
+    "B3": "\U0001F6E1\uFE0F", "A2": "\U0001F3C6", "A1": "\U0001F451",
+}
+
+
+def _band_index(band: str) -> int:
+    try:
+        return RANK_BANDS.index(band)
+    except ValueError:
+        return 0
+
+
+def streak_floor_for_rank(rank_band: str) -> int:
+    """Streak floor scales with rank: the % floor of the band two ranks below
+    the user's current band (clamped at F9). Keeps the streak a habit signal
+    that is never cruel relative to where the student actually is."""
+    idx = _band_index(rank_band)
+    return BAND_FLOOR[RANK_BANDS[max(0, idx - 2)]]
+
+
+def _sg_today():
+    """Today's date in Singapore time (the app's audience is SG)."""
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def get_user_topic_accuracy(user_id: int) -> dict:
+    """Per-topic accuracy (%) from the user's quiz history. {topic: pct}."""
+    import json as _json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT questions_data FROM quiz_attempts WHERE user_id = %s",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+    agg = {}  # topic -> [correct, total]
+    for (qjson,) in rows:
+        try:
+            questions = _json.loads(qjson) if qjson else []
+        except Exception:
+            continue
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            topic = q.get("subtopic") or "Mixed"
+            agg.setdefault(topic, [0, 0])
+            agg[topic][0] += int(bool(q.get("is_correct")))
+            agg[topic][1] += 1
+    return {t: round(100 * c / n) for t, (c, n) in agg.items() if n > 0}
+
+
+@app.get("/api/daily-challenge")
+async def get_daily_challenge(subject: str = "Physics", authorization: str = Header(None)):
+    """Today's Daily Challenge: DAILY_CHALLENGE_LEN questions, weak-topic weighted."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        if not cache.is_loaded:
+            cache.load_questions()
+        pool = cache.get_filtered_questions(subject=subject)
+        if not pool:
+            raise HTTPException(status_code=400, detail=f"No questions found for subject {subject!r}")
+
+        # Group the pool by topic, then draw weighted toward the user's weak topics.
+        from collections import defaultdict
+        by_topic = defaultdict(list)
+        for q in pool:
+            by_topic[q.subtopic or "Mixed"].append(q)
+        for bucket in by_topic.values():
+            random.shuffle(bucket)
+
+        topic_acc = get_user_topic_accuracy(user_id)
+        topic_weights = {}
+        for t in by_topic:
+            if t in topic_acc:
+                # weaker topic -> heavier weight
+                topic_weights[t] = max(5, 100 - topic_acc[t])
+            else:
+                topic_weights[t] = 40  # unseen topic — moderate coverage
+
+        selected = []
+        guard = 0
+        while len(selected) < DAILY_CHALLENGE_LEN and guard < 500:
+            guard += 1
+            avail = [t for t in by_topic if by_topic[t]]
+            if not avail:
+                break
+            weights = [topic_weights[t] for t in avail]
+            t = random.choices(avail, weights=weights, k=1)[0]
+            selected.append(by_topic[t].pop())
+        random.shuffle(selected)
+
+        # Deep-copy and resolve setup diagrams + option images (same as placement).
+        from copy import deepcopy
+        selected = [deepcopy(q) for q in selected]
+        for question in selected:
+            setup_uid = question.uid.rstrip("-")
+            setup_info = cache.setup_info_map.get(setup_uid)
+            if setup_info:
+                if setup_info.get("text"):
+                    question.question_text = setup_info["text"] + "\n\n" + question.question_text
+                if not question.diagram_file_id and setup_info.get("file_id"):
+                    question.diagram_file_id = setup_info["file_id"]
+            if question.diagram_file_id:
+                actual_file_id = cache.resolve_file_id(question.diagram_file_id)
+                if actual_file_id:
+                    question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
+            if question.option_type == "IMAGE":
+                if question.options_image_uid:
+                    options_file_id = cache.resolve_file_id(question.options_image_uid)
+                    if options_file_id:
+                        question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
+            else:
+                if question.setup_image_url:
+                    question.image_url = question.setup_image_url
+
+        # Has the user already cleared today's challenge for this subject?
+        today = _sg_today()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT passed, attempts FROM daily_challenges "
+                "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
+                (user_id, subject, today),
+            )
+            row = cursor.fetchone()
+            cursor.execute(
+                "SELECT rank_band, rank_score FROM user_subject_ranks "
+                "WHERE user_id = %s AND subject = %s",
+                (user_id, subject),
+            )
+            _frow = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+        already_passed = bool(row[0]) if row else False
+        attempts_today = row[1] if row else 0
+        streak_floor = streak_floor_for_rank(_frow[0]) if _frow else STREAK_FLOOR
+        rank = None
+        if _frow:
+            rank = {
+                "rank_band": _frow[0],
+                "rank_score": _frow[1],
+                "tier_name": RANK_TIER_NAMES.get(_frow[0], ""),
+                "tier_icon": RANK_TIER_ICONS.get(_frow[0], ""),
+            }
+
+        return {
+            "subject": subject,
+            "count": len(selected),
+            "questions": selected,
+            "already_passed_today": already_passed,
+            "attempts_today": attempts_today,
+            "streak_floor": streak_floor,
+            "rank": rank,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/daily-challenge: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DailyChallengeSubmitRequest(BaseModel):
+    subject: str = "Physics"
+    score: int
+    total: int
+
+
+@app.post("/api/daily-challenge/submit")
+async def submit_daily_challenge(request: DailyChallengeSubmitRequest, authorization: str = Header(None)):
+    """Score a Daily Challenge: record it, update the streak, move rank if warranted."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        if request.total <= 0:
+            raise HTTPException(status_code=400, detail="total must be greater than 0")
+        score = max(0, min(request.score, request.total))
+        percentage = round(100 * score / request.total)
+        today = _sg_today()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Streak floor scales with rank — the band two ranks below the user's.
+            cursor.execute(
+                "SELECT rank_band FROM user_subject_ranks "
+                "WHERE user_id = %s AND subject = %s",
+                (user_id, request.subject),
+            )
+            _frow = cursor.fetchone()
+            streak_floor = streak_floor_for_rank(_frow[0]) if _frow else STREAK_FLOOR
+            passed = percentage >= streak_floor
+
+            # 1. Upsert today's daily_challenges row (one per user+subject+day).
+            cursor.execute(
+                """
+                INSERT INTO daily_challenges
+                    (user_id, subject, challenge_date, score, total, percentage, passed, attempts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                ON DUPLICATE KEY UPDATE
+                    score = VALUES(score), total = VALUES(total),
+                    percentage = VALUES(percentage),
+                    passed = GREATEST(passed, VALUES(passed)),
+                    attempts = attempts + 1
+                """,
+                (user_id, request.subject, today, score, request.total, percentage, passed),
+            )
+            conn.commit()
+
+            # 2. Streak.
+            cursor.execute(
+                "SELECT current_streak, longest_streak, last_qualified_date, "
+                "freezes_available, freeze_last_granted FROM streaks WHERE user_id = %s",
+                (user_id,),
+            )
+            srow = cursor.fetchone()
+            if not srow:
+                cursor.execute(
+                    "INSERT INTO streaks (user_id, current_streak, longest_streak, "
+                    "freezes_available, freeze_last_granted) VALUES (%s, 0, 0, 1, %s)",
+                    (user_id, today),
+                )
+                conn.commit()
+                current_streak, longest_streak, last_qualified = 0, 0, None
+                freezes, freeze_granted = 1, today
+            else:
+                current_streak, longest_streak, last_qualified, freezes, freeze_granted = srow
+
+            # Freeze regeneration: 1 per 7 days, capped at 1.
+            if freeze_granted is None:
+                freeze_granted = today
+            if (today - freeze_granted).days >= 7 and freezes < 1:
+                freezes = 1
+                freeze_granted = today
+
+            freeze_used = False
+            if passed:
+                if last_qualified == today:
+                    pass  # already earned today (retry after a pass) — no change
+                else:
+                    if last_qualified is None:
+                        current_streak = 1
+                    else:
+                        missed = (today - last_qualified).days - 1
+                        if missed <= 0:
+                            current_streak += 1
+                        elif missed <= freezes:
+                            freezes -= missed
+                            freeze_used = True
+                            current_streak += 1
+                        else:
+                            current_streak = 1
+                    longest_streak = max(longest_streak, current_streak)
+                    last_qualified = today
+                cursor.execute(
+                    "UPDATE streaks SET current_streak = %s, longest_streak = %s, "
+                    "last_qualified_date = %s, freezes_available = %s, "
+                    "freeze_last_granted = %s WHERE user_id = %s",
+                    (current_streak, longest_streak, last_qualified, freezes, freeze_granted, user_id),
+                )
+                conn.commit()
+            else:
+                cursor.execute(
+                    "UPDATE streaks SET freezes_available = %s, freeze_last_granted = %s "
+                    "WHERE user_id = %s",
+                    (freezes, freeze_granted, user_id),
+                )
+                conn.commit()
+
+            # Rank no longer moves on the Daily Challenge. Streak and rank are
+            # deliberately separate systems (decided 2026-05-14): the Daily
+            # Challenge drives the streak only. Rank is set at placement and will
+            # move via a future periodic Rank Assessment (see PHASE0_SPEC.md §4).
+            rank_change = {"changed": False}
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "passed": passed,
+            "score": score,
+            "total": request.total,
+            "percentage": percentage,
+            "streak": {
+                "current": current_streak,
+                "longest": longest_streak,
+                "freeze_used": freeze_used,
+                "freezes_available": freezes,
+                "earned_today": bool(passed),
+            },
+            "rank": rank_change,
+            "streak_floor": streak_floor,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/daily-challenge/submit: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/streak")
+async def get_streak(authorization: str = Header(None)):
+    """Current streak status. Lazily expires a dead streak so the display is honest."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+        today = _sg_today()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT current_streak, longest_streak, last_qualified_date, freezes_available "
+                "FROM streaks WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "current_streak": 0, "longest_streak": 0, "freezes_available": 1,
+                    "did_today": False, "last_qualified_date": None,
+                }
+            current, longest, last_q, freezes = row
+
+            did_today = (last_q == today)
+            # If the gap can't be covered by available freezes, the streak is dead.
+            if last_q is not None and current > 0:
+                missed = (today - last_q).days - 1
+                if missed > freezes:
+                    current = 0
+                    cursor.execute(
+                        "UPDATE streaks SET current_streak = 0 WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    conn.commit()
+            return {
+                "current_streak": current,
+                "longest_streak": longest,
+                "freezes_available": freezes,
+                "did_today": did_today,
+                "last_qualified_date": str(last_q) if last_q else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/streak: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
