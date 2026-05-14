@@ -124,6 +124,7 @@ class Question(BaseModel):
     subtopic: str
     difficulty: str
     level: Optional[str] = None  # Stream/Subject level
+    subject: str = "Physics"  # Physics, Math, etc. (from optional 'Subject' sheet column)
     question_text: str
     options: str
     answer: str
@@ -138,6 +139,7 @@ class Question(BaseModel):
     table_rows: Optional[List[dict]] = None  # For TABLE type
 
 class QuizRequest(BaseModel):
+    subject: Optional[str] = None  # Physics, Math, ...
     difficulty: Optional[str] = None
     subtopic: Optional[str] = None  # Backwards-compat single subtopic
     subtopics: Optional[List[str]] = None  # Up to 3 subtopics; questions distributed across them
@@ -381,9 +383,21 @@ def init_database():
                 password_hash VARCHAR(255),
                 google_id VARCHAR(255),
                 name VARCHAR(255),
+                avatar_url LONGTEXT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Backfill avatar_url on pre-existing databases.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'avatar_url'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER name")
+            print("🔧 Added avatar_url column to users")
 
         # Create quiz_attempts table for storing quiz history
         cursor.execute("""
@@ -399,6 +413,7 @@ def init_database():
                 time_spent_seconds INT,
                 questions_data LONGTEXT,
                 parent_attempt_id INT NULL,
+                quiz_type VARCHAR(20) DEFAULT 'practice',
                 attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 INDEX idx_user_id (user_id),
@@ -436,6 +451,36 @@ def init_database():
                 ADD INDEX idx_parent_attempt_id (parent_attempt_id)
             """)
             print("🔧 Added parent_attempt_id column to quiz_attempts")
+
+        # Backfill the quiz_type column (practice | placement | ranked | daily).
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'quiz_attempts'
+              AND COLUMN_NAME = 'quiz_type'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                ALTER TABLE quiz_attempts
+                ADD COLUMN quiz_type VARCHAR(20) DEFAULT 'practice'
+            """)
+            print("🔧 Added quiz_type column to quiz_attempts")
+
+        # Create user_subject_ranks table (Phase 1 ranking system)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_subject_ranks (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                subject VARCHAR(100) NOT NULL,
+                rank_band VARCHAR(4) NOT NULL,
+                rank_score INT NOT NULL,
+                placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uniq_user_subject (user_id, subject),
+                INDEX idx_usr_rank (user_id)
+            )
+        """)
 
         conn.commit()
         print("✅ Database tables initialized")
@@ -617,6 +662,7 @@ class QuestionCache:
                     subtopic = row[col_map[topic_col]].strip()
                     difficulty = row[col_map['Difficulty']].strip()
                     level = row[col_map['Level']].strip() if 'Level' in col_map else None
+                    subject = row[col_map['Subject']].strip() if 'Subject' in col_map else 'Physics'
                     question_text = row[col_map['Question']].strip()
                     options = row[col_map['Options']].strip()
                     answer = row[col_map['Answer']].strip()
@@ -661,6 +707,7 @@ class QuestionCache:
                         subtopic=subtopic,
                         difficulty=difficulty,
                         level=level,
+                        subject=subject or 'Physics',
                         question_text=question_text,
                         options=parsed_options,
                         answer=answer,
@@ -791,9 +838,20 @@ class QuestionCache:
 
         return sorted(list(levels))
 
+    def get_unique_subjects(self) -> List[str]:
+        """Get all unique subjects (defaults to ['Physics'] when no Subject column)."""
+        if not self.is_loaded:
+            self.load_questions()
+        subjects = set()
+        for q in self.questions:
+            if q.subject:
+                subjects.add(q.subject)
+        return sorted(list(subjects)) or ['Physics']
+
     def get_filtered_questions(self, difficulty: Optional[str] = None,
                                subtopic: Optional[str] = None,
-                               level: Optional[str] = None) -> List[Question]:
+                               level: Optional[str] = None,
+                               subject: Optional[str] = None) -> List[Question]:
         """Get questions filtered by difficulty and subtopic"""
         if not self.is_loaded:
             self.load_questions()
@@ -813,6 +871,10 @@ class QuestionCache:
         # Filter by level (stream/subject)
         if level:
             filtered = [q for q in filtered if q.level and q.level.lower() == level.lower()]
+
+        # Filter by subject (Physics, Math, ...)
+        if subject:
+            filtered = [q for q in filtered if q.subject and q.subject.lower() == subject.lower()]
 
         return filtered
 
@@ -1032,6 +1094,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                     difficulty=request.difficulty,
                     subtopic=topic,
                     level=request.level,
+                    subject=request.subject,
                 )
                 if len(pool) < n:
                     shortfall.append(f"{topic} (need {n}, have {len(pool)})")
@@ -1056,6 +1119,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                 difficulty=request.difficulty,
                 subtopic=single_topic,
                 level=request.level,
+                subject=request.subject,
             )
             if not filtered_questions:
                 raise HTTPException(
@@ -1497,7 +1561,7 @@ async def get_user_profile(authorization: str = Header(None)):
 
         try:
             cursor.execute(
-                "SELECT id, email, name, created_at FROM users WHERE id = %s",
+                "SELECT id, email, name, avatar_url, created_at FROM users WHERE id = %s",
                 (user_id,)
             )
             user = cursor.fetchone()
@@ -1505,7 +1569,7 @@ async def get_user_profile(authorization: str = Header(None)):
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
 
-            user_id, user_email, user_name, created_at = user
+            user_id, user_email, user_name, user_avatar, created_at = user
 
             return {
                 'success': True,
@@ -1513,6 +1577,7 @@ async def get_user_profile(authorization: str = Header(None)):
                     'id': user_id,
                     'email': user_email,
                     'name': user_name,
+                    'avatar_url': user_avatar,
                     'created_at': str(created_at)
                 }
             }
@@ -1525,6 +1590,84 @@ async def get_user_profile(authorization: str = Header(None)):
         raise
     except Exception as e:
         print(f"❌ Error getting user profile: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+class ProfileUpdateRequest(BaseModel):
+    """Update the current user's display name and/or avatar."""
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None  # data URL or external URL; None = leave unchanged
+
+
+@app.put("/api/auth/profile")
+async def update_user_profile(request: ProfileUpdateRequest, authorization: str = Header(None)):
+    """Update the current user's display name and avatar."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get('user_id')
+
+        # Build a dynamic SET clause so we only touch provided fields.
+        updates = []
+        params = []
+        if request.name is not None:
+            name = request.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Name cannot be empty")
+            if len(name) > 255:
+                raise HTTPException(status_code=400, detail="Name is too long (max 255 chars)")
+            updates.append("name = %s")
+            params.append(name)
+        if request.avatar_url is not None:
+            avatar = request.avatar_url.strip()
+            # Cap avatar payload at ~1.5MB to keep the DB sane (data URLs are bulky).
+            if len(avatar) > 1_500_000:
+                raise HTTPException(status_code=400, detail="Avatar image is too large (max ~1MB)")
+            updates.append("avatar_url = %s")
+            params.append(avatar or None)
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="Nothing to update")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            params.append(user_id)
+            cursor.execute(
+                f"UPDATE users SET {', '.join(updates)} WHERE id = %s",
+                tuple(params),
+            )
+            conn.commit()
+
+            cursor.execute(
+                "SELECT id, email, name, avatar_url, created_at FROM users WHERE id = %s",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+            uid, email, name, avatar_url, created_at = row
+            return {
+                'success': True,
+                'user': {
+                    'id': uid,
+                    'email': email,
+                    'name': name,
+                    'avatar_url': avatar_url,
+                    'created_at': str(created_at),
+                },
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error updating profile: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
@@ -1570,7 +1713,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                     if question_idx < len(filtered_questions):
                         question = filtered_questions[question_idx]
                         correct_answer = question.answer.strip()
-                        if user_answer == correct_answer:
+                        if answer_key(user_answer) == answer_key(correct_answer):
                             score += 1
                 except (ValueError, IndexError):
                     continue
@@ -1593,7 +1736,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 for idx, q in enumerate(request.questions):
                     user_answer = request.user_answers.get(str(idx), "")
                     correct_answer = q.get('answer', "").strip()
-                    is_correct = user_answer == correct_answer
+                    is_correct = answer_key(user_answer) == answer_key(correct_answer)
                     q_copy = q.copy()
                     q_copy['is_correct'] = is_correct
                     q_copy['user_answer'] = user_answer
@@ -1611,7 +1754,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 for idx, q in enumerate(filtered_questions[:request.count]):  # Only store the count requested
                     user_answer = request.user_answers.get(str(idx), "")
                     correct_answer = q.answer.strip()
-                    is_correct = user_answer == correct_answer
+                    is_correct = answer_key(user_answer) == answer_key(correct_answer)
                     full_questions_data.append({
                         'uid': q.uid,
                         'qno': q.qno,
@@ -1679,8 +1822,8 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
             cursor.execute("""
                 INSERT INTO quiz_attempts
                 (user_id, name, difficulty, subtopic, score, percentage, total_questions,
-                 time_spent_seconds, questions_data, parent_attempt_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 time_spent_seconds, questions_data, parent_attempt_id, quiz_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 quiz_name,
@@ -1692,6 +1835,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 request.time_spent_seconds,
                 full_questions_json,
                 parent_attempt_id,
+                'practice',
             ))
             conn.commit()
             attempt_id = cursor.lastrowid
@@ -2233,6 +2377,228 @@ async def get_user_stats(authorization: str = Header(None)):
     except Exception as e:
         print(f"❌ Error computing stats: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# ============================================================================
+# PHASE 1: SUBJECTS, PLACEMENT QUIZ & RANKING
+# ============================================================================
+
+def answer_key(val) -> str:
+    """Normalize an answer to a comparable key so option-text vs letter compares correctly.
+    "C. lamp X" -> "C",  "C" -> "C",  "C) foo" -> "C". Falls back to the
+    uppercased string when there is no A-D letter prefix."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if s and s[0] in "ABCDabcd" and (len(s) == 1 or s[1] in ".) :-"):
+        return s[0].upper()
+    return s.upper()
+
+
+def score_to_band(percentage: float) -> str:
+    """Map a percentage score to a Singapore O-Level grade band (A1 best, F9 worst)."""
+    p = percentage
+    if p >= 75: return "A1"
+    if p >= 70: return "A2"
+    if p >= 65: return "B3"
+    if p >= 60: return "B4"
+    if p >= 55: return "C5"
+    if p >= 50: return "C6"
+    if p >= 45: return "D7"
+    if p >= 40: return "E8"
+    return "F9"
+
+
+@app.get("/api/subjects", response_model=List[str])
+async def get_subjects():
+    """All subjects present in the question bank (defaults to [\'Physics\'])."""
+    try:
+        if not cache.is_loaded:
+            cache.load_questions()
+        return cache.get_unique_subjects()
+    except Exception as e:
+        print(f"\u274c Error in /api/subjects: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/placement/questions")
+async def get_placement_questions(subject: str = "Physics", authorization: str = Header(None)):
+    """Return 15 placement questions for a subject, spread across topics and difficulty."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        if not verify_jwt_token(authorization.replace("Bearer ", "")):
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        if not cache.is_loaded:
+            cache.load_questions()
+
+        pool = cache.get_filtered_questions(subject=subject)
+        if not pool:
+            raise HTTPException(status_code=400, detail=f"No questions found for subject {subject!r}")
+
+        TARGET = 15
+        from collections import defaultdict
+        by_diff = defaultdict(list)
+        for q in pool:
+            by_diff[(q.difficulty or "Unknown")].append(q)
+        for bucket in by_diff.values():
+            random.shuffle(bucket)
+
+        # Round-robin across difficulty buckets for an even easy->hard spread.
+        selected = []
+        diff_keys = list(by_diff.keys())
+        random.shuffle(diff_keys)
+        idx = 0
+        guard = 0
+        while len(selected) < TARGET and any(by_diff[k] for k in diff_keys) and guard < 1000:
+            k = diff_keys[idx % len(diff_keys)]
+            if by_diff[k]:
+                selected.append(by_diff[k].pop())
+            idx += 1
+            guard += 1
+        if len(selected) < TARGET:
+            leftover = [q for q in pool if q not in selected]
+            random.shuffle(leftover)
+            selected.extend(leftover[:TARGET - len(selected)])
+        random.shuffle(selected)
+
+        from copy import deepcopy
+        selected = [deepcopy(q) for q in selected]
+        for question in selected:
+            # Attach setup info: some questions keep their diagram/text in a
+            # separate "-setup" row, mapped in cache.setup_info_map.
+            setup_uid = question.uid.rstrip("-")
+            setup_info = cache.setup_info_map.get(setup_uid)
+            if setup_info:
+                if setup_info.get("text"):
+                    question.question_text = setup_info["text"] + "\n\n" + question.question_text
+                if not question.diagram_file_id and setup_info.get("file_id"):
+                    question.diagram_file_id = setup_info["file_id"]
+
+            # Resolve the setup diagram (always, if one exists)
+            if question.diagram_file_id:
+                actual_file_id = cache.resolve_file_id(question.diagram_file_id)
+                if actual_file_id:
+                    question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
+
+            # Resolve the answer-options image for IMAGE questions; otherwise
+            # fall back to the setup diagram as the question's image_url.
+            if question.option_type == "IMAGE":
+                if question.options_image_uid:
+                    options_file_id = cache.resolve_file_id(question.options_image_uid)
+                    if options_file_id:
+                        question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
+            else:
+                if question.setup_image_url:
+                    question.image_url = question.setup_image_url
+
+        return {"subject": subject, "count": len(selected), "questions": selected}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/placement/questions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PlacementSubmitRequest(BaseModel):
+    subject: str = "Physics"
+    score: int
+    total: int
+
+
+@app.post("/api/placement/submit")
+async def submit_placement(request: PlacementSubmitRequest, authorization: str = Header(None)):
+    """Score a placement quiz, compute the F9-A1 band, store it as the starting rank."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        if request.total <= 0:
+            raise HTTPException(status_code=400, detail="total must be greater than 0")
+        score = max(0, min(request.score, request.total))
+        percentage = round(100 * score / request.total)
+        band = score_to_band(percentage)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO user_subject_ranks (user_id, subject, rank_band, rank_score)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE rank_band = VALUES(rank_band), rank_score = VALUES(rank_score)
+                """,
+                (user_id, request.subject, band, percentage),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "success": True,
+            "subject": request.subject,
+            "score": score,
+            "total": request.total,
+            "percentage": percentage,
+            "rank_band": band,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/placement/submit: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ranks")
+async def get_user_ranks(authorization: str = Header(None)):
+    """Return the current user\'s rank per subject."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT subject, rank_band, rank_score, placed_at, updated_at
+                FROM user_subject_ranks
+                WHERE user_id = %s
+                ORDER BY subject
+                """,
+                (user_id,),
+            )
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+        ranks = [
+            {
+                "subject": r[0],
+                "rank_band": r[1],
+                "rank_score": r[2],
+                "placed_at": str(r[3]),
+                "updated_at": str(r[4]),
+            }
+            for r in rows
+        ]
+        return {"ranks": ranks, "has_placement": len(ranks) > 0}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/ranks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.on_event("startup")
