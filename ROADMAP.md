@@ -55,11 +55,11 @@ Tags: **[BUILT]**, **[TODO]**.
 
 **T2.2 — Daily Challenge.** System-generated 10-question quiz, weak-topic weighted. Endpoints: `GET /api/daily-challenge`, `POST /api/daily-challenge/submit`. **[BUILT]** *(difficulty-centring on rank deferred — v1 does weak-topic weighting + mixed difficulty)*
 
-**T2.3 — Streak logic.** Same-day retries, 1 freeze per 7 days, lazy expiry on read. Endpoint: `GET /api/streak`. **[BUILT]** *(2026-05-14: flat 60% floor replaced with a rank-relative floor — band two ranks below the student's, F9 = 35%.)*
+**T2.3 — Streak logic.** **[BUILT — rewritten 2026-05-17]** Earned by hitting `DAILY_CORRECT_TARGET = 10` cumulative correct across any number of Practice quizzes in a day. Practice IS the daily mechanism — no separate system-picked daily quiz. Correct answers stack across attempts. Spec in `PHASE0_SPEC.md` §5. *(The old per-quiz percentage floor — flat, then rank-relative — is obsolete; the legacy `/api/daily-challenge/submit` and `DailyChallenge.jsx` remain in tree but are unreachable from the UI.)*
 
-**T2.4 — Rank movement.** ~~Promote (3-of-5) / demote (4-of-5) wired to Daily Challenge submissions.~~ **[REVERTED 2026-05-14]** — unwired because it made the Daily Challenge drive both streak and rank. Rank now holds at the placement band; movement is deferred to a separate periodic Rank Assessment (see T5.1 and `PHASE0_SPEC.md` §4). The temporary `/api/test/daily-rank` endpoint + `TestPanel.jsx` were removed with it.
+**T2.4 — Rank movement.** Promote (3-of-5) / demote (4-of-5) on a rolling 5-window of Daily Challenges, band-relative thresholds, window resets after each change. **[BUILT — unwired then re-wired same day 2026-05-14]** — the unwire was reversed once Lloyd decided to keep rank and streak on the same input, knowingly accepting the "one bad day affects both" trade-off. (`/api/test/daily-rank` + `TestPanel.jsx` were not restored — if you want them back for testing, easy to recreate.)
 
-**T2.5 — Daily Challenge UI + streak display + rank-up moment.** `DailyChallenge.jsx` page, "🔥 Daily" nav item, streak card on the Dashboard, rank-change banner in the result screen. **[BUILT]** *(rank-change banner is dormant after T2.4 was reverted — it degrades gracefully since `rank.changed` is always false.)*
+**T2.5 — Daily Challenge UI + streak display + rank-up moment.** `DailyChallenge.jsx` page, "🔥 Daily" nav item, streak card on the Dashboard, rank-change banner in the result screen. **[BUILT]** *(rank-change banner is live again as of the 2026-05-14 rewire.)*
 
 ---
 
@@ -79,9 +79,13 @@ Tags: **[BUILT]**, **[TODO]**.
 
 > Spec'd 2026-05-14. Build-gated — do not build until HabitGo is deployed with a real cohort.
 
-**T5.1 — Periodic Rank Assessment.** A separate system-generated assessment that reuses the placement infrastructure (stratified draw, `score_to_band()`). Runs on its own cadence (monthly, or on-demand with a cooldown — TBD). The *only* thing that moves rank. Daily Challenge → streak only; Practice → neither. Spec in `PHASE0_SPEC.md` §4. **[SPEC — not built]**
+**T5.1 — Periodic Rank Assessment** *(optional / lower priority after 2026-05-14 rewire).* A separate system-generated assessment, reusing the placement infrastructure. Originally spec'd as the *only* way to move rank under the "separate systems" design — that design was reversed and the Daily Challenge moves rank again. T5.1 still makes sense as a deeper periodic check (think: monthly mock-exam), but it is **no longer blocking** any rank progression. **[SPEC — not built, low priority]**
 
 **T5.2 — Rank tier names + icons.** Student-facing tier name + emoji icon per band (🌱 Beginner → 👑 Legend). The O-Level letter codes (A1–F9) are kept as the internal data model but **never shown to students** — every rank display is icon + tier name. Appears in the navbar badge, Settings, Dashboard, Daily Challenge intro, and the placement result. **[BUILT 2026-05-14]**
+
+**T5.3 — Rank-up & badge animation system.** Full vision captured 2026-05-14 in `PHASE0_SPEC.md` §4a: layered SVG badge system, metadata-driven animation, Framer Motion idle/hover, GSAP rank-up/-down cinematics, tsParticles bursts. Built in the real Vite + `.jsx` stack (no Figma / Next.js / Tailwind). Pure-presentational components. **The trigger now exists** — rank-up fires on Daily Challenge submissions after the 2026-05-14 rewire — so this is unblocked to build whenever, no longer gated behind T5.1. **[SPEC — buildable now (still build-gated behind deploy + real users)]**
+
+**T5.x — Custom rank badge art.** Replace the emoji icon set with custom-illustrated badges. Art brief written (`RANK_BADGE_BRIEF.md`); awaiting the 9 PNGs in `quiz-maker-frontend/public/ranks/`. Integration is a quick swap once assets land. **[BRIEF DONE — awaiting assets]**
 
 ---
 

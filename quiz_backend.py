@@ -1894,13 +1894,38 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
             print(f"✅ Quiz attempt saved ({kind}): user={user_id}, score={score}/{request.count}, "
                   f"time={request.time_spent_seconds}s, parent={parent_attempt_id}")
 
+            # Credit toward today's cumulative correct target. Every practice quiz
+            # counts; hitting DAILY_CORRECT_TARGET correct in a day earns the streak.
+            daily_progress = None
+            streak_awarded = False
+            try:
+                today_d = _sg_today()
+                # Single-subject for now; broaden when multi-subject lands.
+                _daily_subject = 'Physics'
+                _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
+                    cursor, conn, user_id, _daily_subject, today_d, score, request.count
+                )
+                if _now_p and not _prev_p:
+                    _award_streak_day(cursor, conn, user_id, today_d)
+                    streak_awarded = True
+                daily_progress = {
+                    'today_correct': _today_correct,
+                    'target': DAILY_CORRECT_TARGET,
+                    'today_total': _today_total,
+                    'passed_today': _now_p,
+                    'streak_awarded': streak_awarded,
+                }
+            except Exception as _e:
+                print(f"\u26a0\ufe0f Daily-progress credit failed (non-fatal): {_e}")
+
             return {
                 'success': True,
                 'attempt_id': attempt_id,
                 'score': score,
                 'percentage': percentage,
                 'total_questions': request.count,
-                'message': f'Quiz saved! You scored {score}/{request.count} ({percentage}%)'
+                'message': f'Quiz saved! You scored {score}/{request.count} ({percentage}%)',
+                'daily_progress': daily_progress,
             }
 
         finally:
@@ -2747,6 +2772,103 @@ BAND_FLOOR = {"A1": 75, "A2": 70, "B3": 65, "B4": 60, "C5": 55,
               "C6": 50, "D7": 45, "E8": 40, "F9": 35}
 STREAK_FLOOR = 60          # fallback floor only (used if a user has no rank yet)
 DAILY_CHALLENGE_LEN = 10   # questions per Daily Challenge
+DAILY_CORRECT_TARGET = 10  # cumulative correct answers needed in a day to earn the streak
+
+
+def _award_streak_day(cursor, conn, user_id, today):
+    """Idempotent: credit `today` toward the user's streak. Reusable across endpoints
+    so any "I qualified for today" event can call it. Safe to call multiple times
+    on the same day — no-op after the first credit."""
+    cursor.execute(
+        "SELECT current_streak, longest_streak, last_qualified_date, "
+        "freezes_available, freeze_last_granted FROM streaks WHERE user_id = %s",
+        (user_id,),
+    )
+    srow = cursor.fetchone()
+    if not srow:
+        cursor.execute(
+            "INSERT INTO streaks (user_id, current_streak, longest_streak, "
+            "freezes_available, freeze_last_granted) VALUES (%s, 0, 0, 1, %s)",
+            (user_id, today),
+        )
+        conn.commit()
+        current_streak, longest_streak, last_qualified = 0, 0, None
+        freezes, freeze_granted = 1, today
+    else:
+        current_streak, longest_streak, last_qualified, freezes, freeze_granted = srow
+
+    # Freeze regeneration: 1 per 7 days, capped at 1.
+    if freeze_granted is None:
+        freeze_granted = today
+    if (today - freeze_granted).days >= 7 and freezes < 1:
+        freezes = 1
+        freeze_granted = today
+
+    freeze_used = False
+    if last_qualified == today:
+        # Already credited today — no-op (streak stays where it is).
+        pass
+    else:
+        if last_qualified is None:
+            current_streak = 1
+        else:
+            missed = (today - last_qualified).days - 1
+            if missed <= 0:
+                current_streak += 1
+            elif missed <= freezes:
+                freezes -= missed
+                freeze_used = True
+                current_streak += 1
+            else:
+                current_streak = 1
+        longest_streak = max(longest_streak, current_streak)
+        last_qualified = today
+
+    cursor.execute(
+        "UPDATE streaks SET current_streak = %s, longest_streak = %s, "
+        "last_qualified_date = %s, freezes_available = %s, "
+        "freeze_last_granted = %s WHERE user_id = %s",
+        (current_streak, longest_streak, last_qualified, freezes, freeze_granted, user_id),
+    )
+    conn.commit()
+    return current_streak, longest_streak, freezes, freeze_used
+
+
+def _credit_daily_practice(cursor, conn, user_id, subject, today, correct, total):
+    """Add today's quiz result into the daily cumulative tally.
+    Returns (prev_passed, now_passed, today_correct, today_total)."""
+    cursor.execute(
+        "SELECT score, total, passed FROM daily_challenges "
+        "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
+        (user_id, subject, today),
+    )
+    row = cursor.fetchone()
+    prev_correct = int(row[0]) if row else 0
+    prev_total   = int(row[1]) if row else 0
+    prev_passed  = bool(row[2]) if row else False
+
+    new_correct = prev_correct + max(0, int(correct or 0))
+    new_total   = prev_total + max(0, int(total or 0))
+    new_pct     = round(100 * new_correct / new_total) if new_total else 0
+    new_passed  = new_correct >= DAILY_CORRECT_TARGET
+
+    if row:
+        cursor.execute(
+            "UPDATE daily_challenges SET score=%s, total=%s, percentage=%s, "
+            "passed=%s, attempts=attempts+1 "
+            "WHERE user_id=%s AND subject=%s AND challenge_date=%s",
+            (new_correct, new_total, new_pct, new_passed, user_id, subject, today),
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO daily_challenges "
+            "(user_id, subject, challenge_date, score, total, percentage, passed, attempts) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 1)",
+            (user_id, subject, today, new_correct, new_total, new_pct, new_passed),
+        )
+    conn.commit()
+    return prev_passed, new_passed, new_correct, new_total
+
 
 # Student-facing tier name + description for each O-Level band (worst -> best).
 RANK_TIER_NAMES = {
@@ -2935,6 +3057,24 @@ async def get_daily_challenge(subject: str = "Physics", authorization: str = Hea
                 "tier_icon": RANK_TIER_ICONS.get(_frow[0], ""),
             }
 
+        # Today's cumulative correct progress (drives Home's "X / 10 today" card)
+        # We re-read because the row above only returned (passed, attempts).
+        try:
+            conn2 = get_db_connection()
+            cursor2 = conn2.cursor()
+            cursor2.execute(
+                "SELECT score, total FROM daily_challenges "
+                "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
+                (user_id, subject, today),
+            )
+            _drow = cursor2.fetchone()
+            today_correct = int(_drow[0]) if _drow else 0
+            today_total   = int(_drow[1]) if _drow else 0
+            cursor2.close(); conn2.close()
+        except Exception:
+            today_correct = 0
+            today_total = 0
+
         return {
             "subject": subject,
             "count": len(selected),
@@ -2943,6 +3083,12 @@ async def get_daily_challenge(subject: str = "Physics", authorization: str = Hea
             "attempts_today": attempts_today,
             "streak_floor": streak_floor,
             "rank": rank,
+            "daily_progress": {
+                "today_correct": today_correct,
+                "today_total": today_total,
+                "target": DAILY_CORRECT_TARGET,
+                "passed_today": already_passed,
+            },
         }
     except HTTPException:
         raise
@@ -3063,11 +3209,57 @@ async def submit_daily_challenge(request: DailyChallengeSubmitRequest, authoriza
                 )
                 conn.commit()
 
-            # Rank no longer moves on the Daily Challenge. Streak and rank are
-            # deliberately separate systems (decided 2026-05-14): the Daily
-            # Challenge drives the streak only. Rank is set at placement and will
-            # move via a future periodic Rank Assessment (see PHASE0_SPEC.md §4).
+            # 3. Rank movement — rolling window of Daily Challenges since the last
+            #    rank change (placement or a previous movement reset the window).
+            #    Re-wired 2026-05-14: Daily Challenge drives streak AND rank again.
+            #    Trade-off knowingly accepted: one bad day affects both.
             rank_change = {"changed": False}
+            cursor.execute(
+                "SELECT rank_band, rank_score, updated_at FROM user_subject_ranks "
+                "WHERE user_id = %s AND subject = %s",
+                (user_id, request.subject),
+            )
+            rrow = cursor.fetchone()
+            if rrow:
+                cur_band, cur_score, rank_updated_at = rrow
+                cursor.execute(
+                    "SELECT percentage FROM daily_challenges "
+                    "WHERE user_id = %s AND subject = %s AND updated_at > %s "
+                    "ORDER BY challenge_date DESC LIMIT 5",
+                    (user_id, request.subject, rank_updated_at),
+                )
+                window = [r[0] for r in cursor.fetchall()]
+                if len(window) >= 5:
+                    idx = _band_index(cur_band)
+                    new_band = None
+                    # Promote: 3 of last 5 at/above the next band's floor.
+                    if idx < len(RANK_BANDS) - 1:
+                        next_up = RANK_BANDS[idx + 1]
+                        if sum(1 for p in window if p >= BAND_FLOOR[next_up]) >= 3:
+                            new_band = next_up
+                    # Demote: 4 of last 5 below the current band's floor.
+                    if new_band is None and idx > 0:
+                        if sum(1 for p in window if p < BAND_FLOOR[cur_band]) >= 4:
+                            new_band = RANK_BANDS[idx - 1]
+                    if new_band:
+                        new_score = round(sum(window) / len(window))
+                        cursor.execute(
+                            "UPDATE user_subject_ranks SET rank_band = %s, rank_score = %s "
+                            "WHERE user_id = %s AND subject = %s",
+                            (new_band, new_score, user_id, request.subject),
+                        )
+                        cursor.execute(
+                            "INSERT INTO rank_history (user_id, subject, rank_band, rank_score) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (user_id, request.subject, new_band, new_score),
+                        )
+                        conn.commit()
+                        rank_change = {
+                            "changed": True,
+                            "direction": "up" if _band_index(new_band) > idx else "down",
+                            "old_band": cur_band,
+                            "new_band": new_band,
+                        }
         finally:
             cursor.close()
             conn.close()

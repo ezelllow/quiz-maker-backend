@@ -51,54 +51,159 @@ Each band carries a student-facing **tier name** (cosmetic layer over the band).
 - Sets the **starting rank only**. No streak, no rank movement from placement.
 - Result stored in `user_subject_ranks`.
 
-## 4. Rank movement rule
+## 4. Rank movement rule **[BUILT — re-wired 2026-05-14 afternoon]**
 
-**Revised 2026-05-14 — rank and the Daily Challenge are fully separate inputs.**
+**The Daily Challenge moves rank.** Rank and streak run on the *same input* (Daily
+Challenge submissions), with different mechanics.
 
-The original Phase 2 design moved rank on a rolling window of the last 5 Daily
-Challenges. That was **unwired on 2026-05-14**: it made the Daily Challenge do two
-jobs (streak *and* rank), so a single bad day was a double punishment. The streak
-and the rank must move on **separate inputs**.
+Rank moves on a rolling window of the **last 5 Daily Challenges** for that subject,
+counted since the last rank change (placement or a previous movement reset the window):
 
-Current state **[BUILT]**:
-- Rank is set **once, at placement**, and holds there. The Daily Challenge no longer
-  moves it. `submit_daily_challenge` always returns `rank_change = {"changed": False}`.
+- **Promote** one band when **3 of the last 5** Daily Challenges score at or above
+  the *next* band's % floor.
+- **Demote** one band only when **4 of the last 5** fall below the *current* band's floor.
+- Asymmetric on purpose — easier to hold a band than to drop it, so one bad day
+  doesn't tank a student.
+- One band per move. No skipping bands up or down.
+- After any movement, the window resets — fresh 5 needed before the next change.
 
-Target state — **periodic Rank Assessment [SPEC — not built]**:
-- A separate, **system-generated assessment** (the student does not pick topic,
-  difficulty, or questions — same anti-gaming lock as placement).
-- Reuses the placement infrastructure: stratified question draw, `score_to_band()`.
-- Runs on its **own cadence** — monthly, or on-demand with a cooldown (TBD).
-- Recomputes the band from that assessment's score. One band per move, no skipping.
-- This is the *only* thing that moves rank. Daily Challenge → streak only. Practice
-  → neither. Three inputs, three jobs, no overlap.
+> **Design history.** The original Phase 2 build had this. It was unwired earlier on
+> 2026-05-14 (morning) over a "Daily Challenge does two jobs" concern, with a future
+> periodic Rank Assessment spec'd as the would-be replacement. Re-wired the same
+> day (afternoon) on Lloyd's decision — knowingly re-accepting the trade-off that
+> one bad Daily Challenge affects both streak and rank.
 
-> Build gate: the Rank Assessment is spec-only until HabitGo is deployed and has a
-> real cohort. Don't build a third rank mechanism for zero users.
+> **Consequence for T5.1.** The periodic Rank Assessment (`PHASE0_SPEC.md` §4a stays
+> for reference, ROADMAP §T5.1) is **no longer required for rank to move** — rank
+> moves on the Daily Challenge again. T5.1 becomes optional / lower-priority: build
+> only if a separate, deeper assessment is genuinely wanted later.
 
-## 5. Streak qualification rule **[SPEC — Phase 2]**
+> **Consequence for T5.3 (rank-up animation).** The trigger now exists — rank-up
+> events fire on Daily Challenge submissions. The animation can be built whenever
+> Lloyd wants; it no longer waits on T5.1. The dormant `daily-rank-change` banner
+> in `DailyChallenge.jsx` becomes live again automatically (no frontend change
+> needed — `rank_change` will start returning real `{changed: true, ...}` payloads).
 
-The anti-gaming lock is **who picks the questions**, not the score.
+### 4a. Rank-up & badge animation system **[SPEC — ships with T5.1]**
 
-- A day's streak is earned by completing that day's **Daily Challenge** and clearing
-  the **rank-relative floor**: the % floor of the band **two ranks below** the
-  student's current rank (clamped at F9 = 35%). So an A1 student needs 65%, a B3
-  student needs 55%, an F9/E8/D7 student needs 35%. *(Locked 2026-05-14.)*
-- The two-band buffer is deliberate — it keeps the streak a *habit* signal, not a
-  mastery test. A student would have to perform two full bands below their rank to
-  lose the streak. Rank never reads the streak; the streak reads rank (one-way).
-- **Daily Challenge** = system-generated, **10 questions**, drawn from the user's
-  weak topics in their subject, difficulty centred on their current rank band.
-  The student does **not** pick topic, difficulty, or questions.
-- Failed the floor? **Retry the same day** with a fresh question set. Failing an
-  attempt doesn't break the streak — only failing to clear it before the day ends does.
-- One Daily Challenge counts per calendar day.
+The premium rank progression experience. Spec'd from Lloyd's full vision on
+2026-05-14. **Not built** — there is no rank-change event until the Rank Assessment
+(T5.1) exists, and the whole system is build-gated behind deployment + a real
+cohort. This section captures the vision faithfully so nothing is lost; the
+build happens *with* T5.1, never before.
+
+**Stack reality (what's viable vs. not).** The original brief assumed Figma +
+Next.js + Tailwind + TypeScript. The actual app is React + **Vite**, plain `.jsx`,
+plain CSS. So:
+- ✅ **Framer Motion** — idle/hover/UI motion. Works in Vite.
+- ✅ **GSAP** — cinematic rank-up/-down timelines. Works in Vite.
+- ✅ **tsParticles** — particle bursts + ambient particles. Works in Vite.
+- ⚠️ **React Three Fiber** — works in Vite, but *defer hard*. Legendary-rank /
+  special-cinematic use only, if ever. Do not 3D-ify the app.
+- ❌ **Figma / Illustrator** — no tooling available. SVG badges are hand-authored
+  or produced via `RANK_BADGE_BRIEF.md`.
+- ❌ **Next.js / Tailwind / TypeScript** — not the project's stack. Build in
+  `.jsx` + plain CSS. File names below are `.jsx` / `.js`, not `.tsx` / `.ts`.
+  No framework migration — that is explicitly out of scope.
+
+**Badge design system.** SVG only (no PNG) — scalable, animatable, performant.
+Each badge is layered: outer frame, inner emblem, glow layer, highlight/reflection
+layer, shadow layer. One reusable component system so all 9 share a cohesive look.
+Progression: higher tiers add stronger glow, more emblem complexity, animated
+shine, floating particles, a premium metallic/crystal feel.
+
+**Badge idle animations** *(the one slice that needs no rank-up trigger — badges
+already render in 5 places, so this could be built earlier than the rest).* Subtle
+idle float, slow glow pulse, periodic shine sweep, hover elevation. Framer Motion
+for idle/hover; CSS gradients for the shine sweep; SVG masks for reflections.
+
+**Rank-up cinematic — GSAP timeline.** One orchestrated timeline, not independent
+animations:
+1. XP/score bar fills *(see open question — HabitGo has no XP system)*
+2. Screen glow intensifies
+3. Background darkens slightly
+4. Subtle UI shake
+5. Particle burst (tsParticles)
+6. Old badge scales down / fades
+7. New badge rotates + scales in (overshoot)
+8. Glow pulse expands outward
+9. "RANK UP" text animates in
+10. Continue button fades in
+
+**Rank-down.** Also a GSAP timeline, but darker/desaturated, softer particles,
+controlled downward motion, fading glow. Acknowledgement, not punishment — never
+dramatic or frustrating.
+
+**Motion language.** Use: blur transitions, glow pulses, additive-lighting feel,
+scaling overshoot, eased curves (spring/`power` easing), staggered particles,
+smooth opacity fades. Avoid: linear timing, harsh movement, cheesy game effects,
+over-neon visuals.
+
+**File structure** (adapted to the real stack):
+- `src/components/rank/` — `RankBadge.jsx`, `RankUpAnimation.jsx`,
+  `RankDownAnimation.jsx`, `ParticleLayer.jsx` (`XPBar.jsx` pending the XP decision)
+- `src/assets/ranks/` — `beginner.svg` … `legend.svg`
+- `src/data/rankMetadata.js`
+
+**Metadata-driven (the smart part).** `rankMetadata.js` defines per rank: colors,
+glow intensity, particle type, animation tier, icon asset, rarity level, unlock
+effects. The animation components *read* this metadata — no per-rank hardcoded
+animation logic. Adding/retuning a rank is a data edit, not a code edit.
+
+**Trigger contract.** The rank-up/-down components mount from the Rank Assessment
+result screen when its submit response has `rank.changed === true`, reusing the
+existing `{ changed, direction, old_band, new_band }` shape (+ tier name/icon) —
+the same shape the now-dormant `daily-rank-change` banner in `DailyChallenge.jsx`
+already reads. Components stay pure-presentational: props in, animation out.
+
+**Open questions for build time:**
+1. **XP bar.** HabitGo has *no XP system* — it has streaks and ranks. Step 1 of the
+   rank-up timeline ("XP bar fills") maps to nothing that exists. Options: drop the
+   step; replace it with the Rank Assessment *score* bar filling; or introduce XP as
+   genuine new scope (flag: that's its own project, not part of this).
+2. **R3F.** Confirm whether legendary-rank 3D is in scope at all, or cut entirely.
+3. **Particle burst.** `tsParticles` vs. a lighter hand-rolled burst — decide once
+   we see real bundle-size impact.
+
+**Cleanup that comes with this.** When T5.1 ships, remove the dormant
+`daily-rank-change` banner from `DailyChallenge.jsx` — rank no longer moves there.
+
+## 5. Streak qualification rule **[BUILT — rewritten 2026-05-17]**
+
+**The streak rewards *effort over the whole day*, not one perfect quiz.**
+
+A student earns today's streak when they accumulate **`DAILY_CORRECT_TARGET = 10`
+correct answers across any number of Practice quizzes** in the day. Correct answers
+**stack** across attempts — they can build it up in chunks of 5, or 3+3+4, or one
+big 10. With enough effort, anyone gets the streak.
+
+Practice IS the daily mechanism — there is no separate system-picked daily quiz.
+The student picks topic / difficulty / question count themselves and takes as many
+practice quizzes as they want; the backend tallies their daily correct count.
+
+Mechanics:
+
+- Every `POST /api/quiz/submit` calls `_credit_daily_practice(...)` which upserts
+  today's row in `daily_challenges` with cumulative `score` (correct) and `total`
+  (attempted). When `score >= 10` the row is marked `passed = TRUE`.
+- The moment `passed` flips from FALSE → TRUE that day, `_award_streak_day(...)`
+  fires — increments `current_streak`, updates `longest_streak`, sets
+  `last_qualified_date = today`. Idempotent: repeat hits the same day are no-ops.
 - **Streak freeze:** 1 per 7 days, auto-applied. A missed day consumes a freeze
   instead of resetting. No freeze available → streak resets to 0.
+- One streak credit per calendar day (Singapore time). Bonus practice after hitting
+  the target is encouraged but doesn't compound the streak that day.
 
-> Streak = habit (rank-relative floor, never cruel relative to where the student is).
-> Rank = mastery (section 4). They share one input — the Daily Challenge — but apply
-> different thresholds and mechanics. Deliberately separate, not combined.
+> The old per-quiz percentage floor (rank-relative, 35%-65%) is **obsolete** under
+> this model. The whole concept of "pass-rate threshold on one daily quiz" is
+> gone — instead it's "how many correct over the day." `STREAK_FLOOR` and
+> `streak_floor_for_rank()` stay in the code as no-ops in case the old system-picked
+> daily flow is ever resurrected.
+
+> The legacy `/api/daily-challenge/submit` endpoint and `DailyChallenge.jsx`
+> component are not deleted (they still work in isolation), but no part of the
+> live UI calls them — they are effectively dead code under the new model.
+
 
 ## 6. Practice vs Daily Challenge boundary **[SPEC — Phase 2]**
 
