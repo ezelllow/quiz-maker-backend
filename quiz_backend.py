@@ -399,6 +399,48 @@ def init_database():
             cursor.execute("ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER name")
             print("🔧 Added avatar_url column to users")
 
+        # XP column (Phase 3 leaderboard). Backfill in the same conditional so
+        # we only compute legacy XP exactly once per database.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'xp'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN xp BIGINT NOT NULL DEFAULT 0 AFTER avatar_url")
+            print("🔧 Added xp column to users")
+
+            # Backfill XP from quiz_attempts. Streak multiplier is omitted —
+            # we don't know what the streak was at the moment of each attempt,
+            # so legacy XP is base * difficulty only. Live submissions get the
+            # full formula including the streak bonus.
+            try:
+                cursor.execute("""
+                    SELECT user_id,
+                           SUM(score * %s *
+                               CASE LOWER(COALESCE(difficulty, ''))
+                                   WHEN 'easy'   THEN %s
+                                   WHEN 'medium' THEN %s
+                                   WHEN 'hard'   THEN %s
+                                   ELSE 1.0
+                               END) AS xp
+                    FROM quiz_attempts
+                    WHERE score IS NOT NULL
+                    GROUP BY user_id
+                """, (XP_BASE_PER_CORRECT, XP_DIFFICULTY_MULT['easy'],
+                      XP_DIFFICULTY_MULT['medium'], XP_DIFFICULTY_MULT['hard']))
+                totals = cursor.fetchall()
+                for uid, total in totals:
+                    cursor.execute(
+                        "UPDATE users SET xp = %s WHERE id = %s",
+                        (int(round(total or 0)), uid),
+                    )
+                conn.commit()
+                print(f"🔧 Backfilled XP for {len(totals)} user(s) from quiz_attempts")
+            except Exception as _e:
+                print(f"⚠️ XP backfill failed (non-fatal): {_e}")
+
         # Create quiz_attempts table for storing quiz history
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS quiz_attempts (
@@ -476,11 +518,23 @@ def init_database():
                 last_qualified_date DATE NULL,
                 freezes_available INT DEFAULT 1,
                 freeze_last_granted DATE NULL,
+                freeze_used_date DATE NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 UNIQUE KEY uniq_streak_user (user_id)
             )
         """)
+
+        # Backfill freeze_used_date on pre-existing databases
+        cursor.execute("""
+            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'streaks'
+              AND COLUMN_NAME = 'freeze_used_date'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE streaks ADD COLUMN freeze_used_date DATE NULL AFTER freeze_last_granted")
+            print("\U0001f527 Added freeze_used_date column to streaks")
 
         # Create rank_history table (Phase 2 — append a row on every rank change)
         cursor.execute("""
@@ -1433,7 +1487,9 @@ async def signup(request: SignupRequest):
                 user={
                     'id': user_id,
                     'email': request.email,
-                    'name': request.name
+                    'name': request.name,
+                    'avatar_url': None,
+                    'xp': 0,
                 }
             )
 
@@ -1461,7 +1517,7 @@ async def login(request: LoginRequest):
         try:
             # Find user by email
             cursor.execute(
-                "SELECT id, email, password_hash, name FROM users WHERE email = %s",
+                "SELECT id, email, password_hash, name, avatar_url, xp FROM users WHERE email = %s",
                 (request.email,)
             )
             user = cursor.fetchone()
@@ -1469,7 +1525,7 @@ async def login(request: LoginRequest):
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
-            user_id, email, password_hash, name = user
+            user_id, email, password_hash, name, avatar_url, user_xp = user
 
             # Verify password
             if not verify_password(request.password, password_hash):
@@ -1487,7 +1543,9 @@ async def login(request: LoginRequest):
                 user={
                     'id': user_id,
                     'email': email,
-                    'name': name
+                    'name': name,
+                    'avatar_url': avatar_url,
+                    'xp': int(user_xp or 0),
                 }
             )
 
@@ -1525,26 +1583,27 @@ async def google_login(request: GoogleLoginRequest):
         try:
             # Check if user exists by google_id
             cursor.execute(
-                "SELECT id, email, name FROM users WHERE google_id = %s",
+                "SELECT id, email, name, avatar_url, xp FROM users WHERE google_id = %s",
                 (google_id,)
             )
             user = cursor.fetchone()
 
+            avatar_url = None
             if user:
                 # Existing Google user
-                user_id, user_email, user_name = user
+                user_id, user_email, user_name, avatar_url, google_xp = user
                 print(f"✅ Google user logged in: {user_email}")
             else:
                 # Check if email exists (from other signup method)
                 cursor.execute(
-                    "SELECT id, name FROM users WHERE email = %s",
+                    "SELECT id, name, avatar_url, xp FROM users WHERE email = %s",
                     (email,)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Link Google account to existing email
-                    user_id, user_name = existing
+                    user_id, user_name, avatar_url, google_xp = existing
                     cursor.execute(
                         "UPDATE users SET google_id = %s WHERE id = %s",
                         (google_id, user_id)
@@ -1560,6 +1619,7 @@ async def google_login(request: GoogleLoginRequest):
                     conn.commit()
                     user_id = cursor.lastrowid
                     user_name = name
+                    google_xp = 0
                     print(f"✅ New Google user registered: {email}")
 
             # Create JWT token
@@ -1572,7 +1632,9 @@ async def google_login(request: GoogleLoginRequest):
                 user={
                     'id': user_id,
                     'email': email,
-                    'name': user_name
+                    'name': user_name,
+                    'avatar_url': avatar_url,
+                    'xp': int(google_xp or 0),
                 }
             )
 
@@ -1894,6 +1956,31 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
             print(f"✅ Quiz attempt saved ({kind}): user={user_id}, score={score}/{request.count}, "
                   f"time={request.time_spent_seconds}s, parent={parent_attempt_id}")
 
+            # Award XP first so daily_progress can also report the new total.
+            # Streak bonus uses the streak the user walked IN with — the very
+            # first qualifying quiz of a new streak gets no streak bonus.
+            xp_delta = 0
+            xp_total = 0
+            try:
+                cursor.execute(
+                    "SELECT current_streak FROM streaks WHERE user_id = %s",
+                    (user_id,),
+                )
+                _srow = cursor.fetchone()
+                pre_streak = int(_srow[0]) if _srow and _srow[0] is not None else 0
+                xp_delta = xp_for_quiz(score, request.difficulty, pre_streak)
+                if xp_delta > 0:
+                    cursor.execute(
+                        "UPDATE users SET xp = xp + %s WHERE id = %s",
+                        (xp_delta, user_id),
+                    )
+                    conn.commit()
+                cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
+                _xrow = cursor.fetchone()
+                xp_total = int(_xrow[0]) if _xrow and _xrow[0] is not None else 0
+            except Exception as _xe:
+                print(f"⚠️ XP award failed (non-fatal): {_xe}")
+
             # Credit toward today's cumulative correct target. Every practice quiz
             # counts; hitting DAILY_CORRECT_TARGET correct in a day earns the streak.
             daily_progress = None
@@ -1905,15 +1992,36 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
                     cursor, conn, user_id, _daily_subject, today_d, score, request.count
                 )
+                _current_streak = None
+                _longest_streak = None
+                _freeze_used = False
                 if _now_p and not _prev_p:
-                    _award_streak_day(cursor, conn, user_id, today_d)
+                    _current_streak, _longest_streak, _freezes, _freeze_used = _award_streak_day(
+                        cursor, conn, user_id, today_d
+                    )
                     streak_awarded = True
+                else:
+                    # Even when nothing was awarded, send the latest streak counts
+                    # so the UI always has the truth.
+                    try:
+                        cursor.execute(
+                            "SELECT current_streak, longest_streak FROM streaks WHERE user_id = %s",
+                            (user_id,),
+                        )
+                        _srow = cursor.fetchone()
+                        if _srow:
+                            _current_streak, _longest_streak = _srow[0], _srow[1]
+                    except Exception:
+                        pass
                 daily_progress = {
                     'today_correct': _today_correct,
                     'target': DAILY_CORRECT_TARGET,
                     'today_total': _today_total,
                     'passed_today': _now_p,
                     'streak_awarded': streak_awarded,
+                    'freeze_used': _freeze_used,
+                    'current_streak': _current_streak,
+                    'longest_streak': _longest_streak,
                 }
             except Exception as _e:
                 print(f"\u26a0\ufe0f Daily-progress credit failed (non-fatal): {_e}")
@@ -1926,6 +2034,8 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 'total_questions': request.count,
                 'message': f'Quiz saved! You scored {score}/{request.count} ({percentage}%)',
                 'daily_progress': daily_progress,
+                'xp_delta': xp_delta,
+                'xp_total': xp_total,
             }
 
         finally:
@@ -2775,13 +2885,44 @@ DAILY_CHALLENGE_LEN = 10   # questions per Daily Challenge
 DAILY_CORRECT_TARGET = 10  # cumulative correct answers needed in a day to earn the streak
 
 
+# ---------------------------------------------------------------------------
+# XP system (Phase 3 leaderboard). Formula:
+#   xp_award = round(correct * BASE * difficulty_mult * streak_mult)
+#   streak_mult = 1 + min(streak, 30) * 0.02   (caps at +60% on 30-day streak)
+# Difficulty multipliers mirror what the Practice UI advertises.
+# ---------------------------------------------------------------------------
+XP_BASE_PER_CORRECT = 10
+XP_DIFFICULTY_MULT = {"easy": 0.5, "medium": 1.5, "hard": 2.0}
+XP_STREAK_CAP_DAYS = 30
+XP_STREAK_PER_DAY  = 0.02
+
+
+def xp_for_quiz(correct, difficulty, current_streak):
+    """Compute the XP award for a single quiz submission. Pure function — safe
+    to call from anywhere. Always returns a non-negative int.
+    """
+    correct = max(0, int(correct or 0))
+    diff_key = (difficulty or '').strip().lower()
+    diff_mult = XP_DIFFICULTY_MULT.get(diff_key, 1.0)
+    streak    = max(0, int(current_streak or 0))
+    streak_mult = 1.0 + min(streak, XP_STREAK_CAP_DAYS) * XP_STREAK_PER_DAY
+    return int(round(correct * XP_BASE_PER_CORRECT * diff_mult * streak_mult))
+
+
 def _award_streak_day(cursor, conn, user_id, today):
     """Idempotent: credit `today` toward the user's streak. Reusable across endpoints
     so any "I qualified for today" event can call it. Safe to call multiple times
-    on the same day — no-op after the first credit."""
+    on the same day — no-op after the first credit.
+
+    Freeze rules (per PHASE0_SPEC §5/§6):
+    - Hard reset to 1 freeze on the first qualifying day of a new ISO calendar week
+      (Mon-Sun). No stacking — last week's unused freeze is replaced, not added to.
+    - When freeze covers a missed day, freeze_used_date records WHICH day it bridged.
+    """
+    from datetime import timedelta
     cursor.execute(
         "SELECT current_streak, longest_streak, last_qualified_date, "
-        "freezes_available, freeze_last_granted FROM streaks WHERE user_id = %s",
+        "freezes_available, freeze_last_granted, freeze_used_date FROM streaks WHERE user_id = %s",
         (user_id,),
     )
     srow = cursor.fetchone()
@@ -2793,14 +2934,13 @@ def _award_streak_day(cursor, conn, user_id, today):
         )
         conn.commit()
         current_streak, longest_streak, last_qualified = 0, 0, None
-        freezes, freeze_granted = 1, today
+        freezes, freeze_granted, freeze_used_date = 1, today, None
     else:
-        current_streak, longest_streak, last_qualified, freezes, freeze_granted = srow
+        current_streak, longest_streak, last_qualified, freezes, freeze_granted, freeze_used_date = srow
 
-    # Freeze regeneration: 1 per 7 days, capped at 1.
-    if freeze_granted is None:
-        freeze_granted = today
-    if (today - freeze_granted).days >= 7 and freezes < 1:
+    # Calendar-week freeze regen: hard reset to 1 on new ISO week (Mon-Sun).
+    # No stacking — even an unused freeze from last week is replaced.
+    if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
         freezes = 1
         freeze_granted = today
 
@@ -2818,6 +2958,9 @@ def _award_streak_day(cursor, conn, user_id, today):
             elif missed <= freezes:
                 freezes -= missed
                 freeze_used = True
+                # Record WHICH day was bridged (the one right before `today`).
+                # Cap-1 freeze means only 1 missed day can be bridged at a time.
+                freeze_used_date = today - timedelta(days=1)
                 current_streak += 1
             else:
                 current_streak = 1
@@ -2827,8 +2970,8 @@ def _award_streak_day(cursor, conn, user_id, today):
     cursor.execute(
         "UPDATE streaks SET current_streak = %s, longest_streak = %s, "
         "last_qualified_date = %s, freezes_available = %s, "
-        "freeze_last_granted = %s WHERE user_id = %s",
-        (current_streak, longest_streak, last_qualified, freezes, freeze_granted, user_id),
+        "freeze_last_granted = %s, freeze_used_date = %s WHERE user_id = %s",
+        (current_streak, longest_streak, last_qualified, freezes, freeze_granted, freeze_used_date, user_id),
     )
     conn.commit()
     return current_streak, longest_streak, freezes, freeze_used
@@ -2868,6 +3011,71 @@ def _credit_daily_practice(cursor, conn, user_id, subject, today, correct, total
         )
     conn.commit()
     return prev_passed, new_passed, new_correct, new_total
+
+
+
+def _lazy_streak_maintenance(cursor, conn, user_id, today):
+    """Read-time streak maintenance, called from GET endpoints.
+
+    Per spec: "Freeze automatically protects the streak if exactly 1 day is missed."
+    This used to require the user to qualify on the day AFTER the gap — but a real
+    user just opens the app and expects the freeze to have already fired. So on
+    every read we:
+      1. Regen the weekly freeze (cap-1) if a new ISO week has started.
+      2. Auto-fire freeze(s) to bridge any gap between last_qualified_date and
+         today that fits inside the user's freeze budget. Bridged days get
+         recorded as freeze_used_date so the weekly strip can render ❄️.
+      3. If the gap is bigger than the budget, reset current_streak to 0.
+
+    Conservative: only mutates when state actually changed. No-op for users with
+    no streak row, or with last_qualified_date == today.
+    """
+    from datetime import timedelta
+    cursor.execute(
+        "SELECT current_streak, last_qualified_date, freezes_available, "
+        "freeze_last_granted, freeze_used_date FROM streaks WHERE user_id = %s",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return
+    current, last_q, freezes, freeze_granted, freeze_used_date = row
+
+    dirty = False
+
+    # 1. Weekly freeze regen (Mon–Sun, ISO). Hard reset to 1 — no stacking.
+    if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
+        freezes = 1
+        freeze_granted = today
+        dirty = True
+
+    # 2/3. Gap handling. Only matters when there's a live streak with a real
+    # last_qualified_date strictly before today.
+    if last_q is not None and current > 0 and last_q < today:
+        missed = (today - last_q).days - 1  # days strictly between (excl. today)
+        if missed > 0:
+            if missed <= freezes:
+                # Auto-fire freeze(s). Record the most recent bridged day so the
+                # weekly strip renders ❄️ on it. Advance last_qualified to the
+                # bridged day so we don't re-fire on the next read.
+                freezes -= missed
+                bridged = today - timedelta(days=1)
+                freeze_used_date = bridged
+                last_q = bridged
+                dirty = True
+            else:
+                # Gap too wide — freeze can't save it. Streak dies; preserve longest.
+                current = 0
+                dirty = True
+
+    if dirty:
+        cursor.execute(
+            "UPDATE streaks SET current_streak = %s, last_qualified_date = %s, "
+            "freezes_available = %s, freeze_last_granted = %s, "
+            "freeze_used_date = %s WHERE user_id = %s",
+            (current, last_q, freezes, freeze_granted, freeze_used_date, user_id),
+        )
+        conn.commit()
 
 
 # Student-facing tier name + description for each O-Level band (worst -> best).
@@ -3301,8 +3509,13 @@ async def get_streak(authorization: str = Header(None)):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            # Lazy maintenance: regen weekly freeze + auto-fire freeze for any
+            # single missed day. Mutates DB so the subsequent SELECT is truth.
+            _lazy_streak_maintenance(cursor, conn, user_id, today)
+
             cursor.execute(
-                "SELECT current_streak, longest_streak, last_qualified_date, freezes_available "
+                "SELECT current_streak, longest_streak, last_qualified_date, "
+                "freezes_available, freeze_last_granted, freeze_used_date "
                 "FROM streaks WHERE user_id = %s",
                 (user_id,),
             )
@@ -3311,26 +3524,18 @@ async def get_streak(authorization: str = Header(None)):
                 return {
                     "current_streak": 0, "longest_streak": 0, "freezes_available": 1,
                     "did_today": False, "last_qualified_date": None,
+                    "freeze_used_date": None,
                 }
-            current, longest, last_q, freezes = row
-
+            current, longest, last_q, freezes, freeze_granted, freeze_used_date = row
             did_today = (last_q == today)
-            # If the gap can't be covered by available freezes, the streak is dead.
-            if last_q is not None and current > 0:
-                missed = (today - last_q).days - 1
-                if missed > freezes:
-                    current = 0
-                    cursor.execute(
-                        "UPDATE streaks SET current_streak = 0 WHERE user_id = %s",
-                        (user_id,),
-                    )
-                    conn.commit()
+
             return {
                 "current_streak": current,
                 "longest_streak": longest,
                 "freezes_available": freezes,
                 "did_today": did_today,
                 "last_qualified_date": str(last_q) if last_q else None,
+                "freeze_used_date": str(freeze_used_date) if freeze_used_date else None,
             }
         finally:
             cursor.close()
@@ -3339,6 +3544,387 @@ async def get_streak(authorization: str = Header(None)):
         raise
     except Exception as e:
         print(f"\u274c Error in /api/streak: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/streak/week")
+async def get_streak_week(authorization: str = Header(None)):
+    """This week's per-day streak status (Mon -> Sun in SG time).
+    Returns 7 day cells each with status: completed / freeze_used / today / missed / upcoming.
+    Drives the Home page's weekly strip."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        from datetime import timedelta
+        today = _sg_today()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Same lazy maintenance as /api/streak so the weekly strip stays in
+            # sync with the counter (e.g. auto-fired freeze shows as ❄️).
+            _lazy_streak_maintenance(cursor, conn, user_id, today)
+
+            # Fetch streak info FIRST — we anchor the week on max(today, last_q)
+            # so test-mode credits that push last_q into a future week still get
+            # rendered. Real users always have last_q <= today, so the anchor
+            # collapses to today and production behaviour is unchanged.
+            cursor.execute(
+                "SELECT last_qualified_date, freeze_used_date FROM streaks WHERE user_id = %s",
+                (user_id,),
+            )
+            srow = cursor.fetchone()
+            last_q = srow[0] if srow and srow[0] else None
+            freeze_used_date = srow[1] if srow and srow[1] else None
+
+            anchor = today if last_q is None else max(today, last_q)
+            monday = anchor - timedelta(days=anchor.weekday())
+            sunday = monday + timedelta(days=6)
+            week_dates = [monday + timedelta(days=i) for i in range(7)]
+
+            cursor.execute(
+                "SELECT challenge_date, passed FROM daily_challenges "
+                "WHERE user_id = %s AND challenge_date BETWEEN %s AND %s",
+                (user_id, monday, sunday),
+            )
+            passed_map = {}
+            for row in cursor.fetchall():
+                d, p = row[0], bool(row[1])
+                passed_map[d] = passed_map.get(d, False) or p
+        finally:
+            cursor.close()
+            conn.close()
+
+        weekday_names = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+        days = []
+        for d in week_dates:
+            if passed_map.get(d):
+                status = 'completed'
+            elif freeze_used_date and d == freeze_used_date:
+                status = 'freeze_used'
+            else:
+                # No data for this day. A day is "upcoming" ONLY if it sits beyond
+                # both real today AND the streak's progress (last_qualified).
+                # Days the streak has already passed through but have no row are
+                # 'missed' (e.g. test-mode skipped Thu while crediting Fri).
+                is_truly_future = d > today and (last_q is None or d > last_q)
+                if is_truly_future:
+                    status = 'upcoming'
+                elif d == today:
+                    status = 'today'   # in progress (today not passed yet)
+                else:
+                    status = 'missed'
+            days.append({
+                'date': str(d),
+                'weekday': weekday_names[d.weekday()],
+                'is_today': d == today,
+                'status': status,
+            })
+
+        return {
+            'week_start': str(monday),
+            'week_end':   str(sunday),
+            'today':      str(today),
+            'days':       days,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/streak/week: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/api/leaderboard")
+async def get_leaderboard(
+    authorization: str = Header(None),
+    period: str = "weekly",
+    limit: int  = 50,
+):
+    """Global leaderboard. `period` is one of:
+      - 'daily'   -> SUM of daily_challenges.score for today (SG)
+      - 'weekly'  -> SUM of daily_challenges.score over current ISO week (Mon-Sun)
+      - 'alltime' -> users.xp
+
+    Returns the top `limit` users plus the current user appended at the end
+    (with their actual rank index) when they fall outside the top slice.
+    """
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        me_id = int(payload.get("user_id"))
+
+        period = (period or "weekly").lower()
+        if period not in {"daily", "weekly", "alltime"}:
+            raise HTTPException(status_code=400, detail="period must be daily|weekly|alltime")
+
+        from datetime import timedelta
+        today  = _sg_today()
+        monday = today - timedelta(days=today.weekday())
+        sunday = monday + timedelta(days=6)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            if period == "alltime":
+                cursor.execute("""
+                    SELECT id, name, avatar_url, COALESCE(xp, 0) AS score
+                    FROM users
+                    WHERE name IS NOT NULL AND name <> ''
+                    ORDER BY score DESC, id ASC
+                """)
+            elif period == "daily":
+                cursor.execute("""
+                    SELECT u.id, u.name, u.avatar_url,
+                           COALESCE(SUM(dc.score), 0) AS score
+                    FROM users u
+                    LEFT JOIN daily_challenges dc
+                      ON dc.user_id = u.id AND dc.challenge_date = %s
+                    WHERE u.name IS NOT NULL AND u.name <> ''
+                    GROUP BY u.id, u.name, u.avatar_url
+                    ORDER BY score DESC, u.id ASC
+                """, (today,))
+            else:  # weekly
+                cursor.execute("""
+                    SELECT u.id, u.name, u.avatar_url,
+                           COALESCE(SUM(dc.score), 0) AS score
+                    FROM users u
+                    LEFT JOIN daily_challenges dc
+                      ON dc.user_id = u.id
+                     AND dc.challenge_date BETWEEN %s AND %s
+                    WHERE u.name IS NOT NULL AND u.name <> ''
+                    GROUP BY u.id, u.name, u.avatar_url
+                    ORDER BY score DESC, u.id ASC
+                """, (monday, sunday))
+
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+        # Build the ranked list. Rank ties share the higher position (dense rank
+        # would be confusing on a podium — competition rank is more familiar).
+        full = []
+        prev_score = None
+        prev_rank  = 0
+        for idx, (uid, name, avatar_url, score) in enumerate(rows, start=1):
+            score = int(score or 0)
+            if prev_score is None or score != prev_score:
+                rank = idx
+                prev_rank  = idx
+                prev_score = score
+            else:
+                rank = prev_rank
+            full.append({
+                "user_id":    int(uid),
+                "name":       name,
+                "avatar_url": avatar_url,
+                "score":      score,
+                "rank":       rank,
+                "is_me":      int(uid) == me_id,
+            })
+
+        top = full[: max(1, int(limit))]
+        # Always include me. If I'm not in the top slice, append my row.
+        if not any(p["is_me"] for p in top):
+            me = next((p for p in full if p["is_me"]), None)
+            if me:
+                top.append(me)
+
+        return {
+            "period":     period,
+            "today":      str(today),
+            "week_start": str(monday),
+            "week_end":   str(sunday),
+            "total_users": len(full),
+            "entries":    top,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/leaderboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# TEMPORARY — STREAK TEST ENDPOINTS (delete before production hardening)
+# ============================================================================
+
+class TestStreakCreditRequest(BaseModel):
+    # 'next'    = day AFTER last_qualified (or today if no streak yet) — clean advance
+    # 'freeze'  = last_qualified + 2 days (skips 1) — exercises freeze logic
+    # 'absolute'= use days_offset relative to today (legacy)
+    mode: str = "next"
+    days_offset: int = 0
+    correct: int = 10
+    subject: str = "Physics"
+
+
+@app.post("/api/test/streak-credit")
+async def test_streak_credit(request: TestStreakCreditRequest, authorization: str = Header(None)):
+    """TEMPORARY — credit `correct` answers to the daily tally for a simulated day
+    (today + days_offset). If the target is crossed, the streak fires through the
+    same `_award_streak_day(...)` path as a real practice quiz. Returns the full
+    streak state so the panel can show what happened."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        from datetime import timedelta
+        correct = max(0, int(request.correct))
+        # "total attempted" — assume each correct came from a 1:1 attempt (kept simple).
+        total = max(correct, 1)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            today_correct = 0
+            today_total   = 0
+            now_p         = False
+            streak_awarded = False
+            freeze_used    = False
+
+            if request.mode == "freeze":
+                # Simulate a MISSED day with auto-freeze: NO daily_challenges row
+                # is created (the bridged day is unqualified). We mutate streaks
+                # directly the same way _lazy_streak_maintenance would on a read
+                # after a real-life missed day.
+                cursor.execute(
+                    "SELECT current_streak, longest_streak, last_qualified_date, "
+                    "freezes_available, freeze_last_granted "
+                    "FROM streaks WHERE user_id = %s",
+                    (user_id,),
+                )
+                _row = cursor.fetchone()
+                if not _row or _row[2] is None:
+                    # No streak yet — nothing to protect. Bail with the current state.
+                    simulated_day = _sg_today()
+                else:
+                    cur_s, long_s, last_q, freezes, freeze_granted = _row
+                    bridged = last_q + timedelta(days=1)   # the "missed" day
+                    simulated_day = bridged
+
+                    # Weekly regen check (matches _award_streak_day / _lazy).
+                    if (freeze_granted is None
+                            or bridged.isocalendar()[:2] != freeze_granted.isocalendar()[:2]):
+                        freezes = 1
+                        freeze_granted = bridged
+
+                    if freezes < 1:
+                        # No freeze available — streak breaks instead.
+                        cursor.execute(
+                            "UPDATE streaks SET current_streak = 0, "
+                            "freeze_last_granted = %s WHERE user_id = %s",
+                            (freeze_granted, user_id),
+                        )
+                        conn.commit()
+                        streak_awarded = False
+                        freeze_used    = False
+                    else:
+                        freezes -= 1
+                        cursor.execute(
+                            "UPDATE streaks SET last_qualified_date = %s, "
+                            "freezes_available = %s, freeze_last_granted = %s, "
+                            "freeze_used_date = %s WHERE user_id = %s",
+                            (bridged, freezes, freeze_granted, bridged, user_id),
+                        )
+                        conn.commit()
+                        # Treat freeze fire as a streak event so the celebration mounts.
+                        streak_awarded = True
+                        freeze_used    = True
+            else:
+                # 'next' / 'absolute' — simulate a real qualifying day.
+                if request.mode == "absolute":
+                    simulated_day = _sg_today() + timedelta(days=int(request.days_offset))
+                else:
+                    cursor.execute(
+                        "SELECT last_qualified_date FROM streaks WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    _row = cursor.fetchone()
+                    last_q = _row[0] if _row and _row[0] else None
+                    simulated_day = (last_q + timedelta(days=1)) if last_q else _sg_today()
+
+                prev_p, now_p, today_correct, today_total = _credit_daily_practice(
+                    cursor, conn, user_id, request.subject, simulated_day, correct, total
+                )
+                if now_p and not prev_p:
+                    _cs, _ls, _fz, _fu = _award_streak_day(cursor, conn, user_id, simulated_day)
+                    streak_awarded = True
+                    freeze_used    = _fu
+
+            cursor.execute(
+                "SELECT current_streak, longest_streak, last_qualified_date, "
+                "freezes_available, freeze_last_granted FROM streaks WHERE user_id = %s",
+                (user_id,),
+            )
+            srow = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "simulated_day":      str(simulated_day),
+            "credited_correct":   correct,
+            "today_correct":      today_correct,
+            "today_total":        today_total,
+            "target":             DAILY_CORRECT_TARGET,
+            "passed_today":       now_p,
+            "streak_awarded":     streak_awarded,
+            "freeze_used":        freeze_used,
+            "current_streak":     srow[0] if srow else 0,
+            "longest_streak":     srow[1] if srow else 0,
+            "last_qualified_date": str(srow[2]) if srow and srow[2] else None,
+            "freezes_available":  srow[3] if srow else 0,
+            "freeze_last_granted": str(srow[4]) if srow and srow[4] else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/test/streak-credit: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/test/streak-reset")
+async def test_streak_reset(authorization: str = Header(None)):
+    """TEMPORARY — wipe this user's daily_challenges + streaks rows so the test
+    panel can start over with a clean slate. Does NOT touch quiz_attempts or rank."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM daily_challenges WHERE user_id = %s", (user_id,))
+            n_daily = cursor.rowcount
+            cursor.execute("DELETE FROM streaks WHERE user_id = %s", (user_id,))
+            n_streak = cursor.rowcount
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        return {"ok": True, "deleted_daily_rows": n_daily, "deleted_streak_rows": n_streak}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\u274c Error in /api/test/streak-reset: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
