@@ -34,7 +34,7 @@ load_dotenv()
 
 SPREADSHEET_ID = '1TOmLo9UNpzOggeX27j1p6Q2NdAnCWpRJ1ErYAEJ-sZU'
 QUESTION_FOLDER_ID = '10TtAVgxTsczSFxIrkwSSy_KFQlebWCiX'
-SHEET_NAME = 'Paper1'  # Just the sheet name, no range
+SHEET_NAME = 'Physics'  # Just the sheet name, no range
 
 # Google API Scopes
 SCOPES = [
@@ -196,6 +196,7 @@ class QuizSubmissionRequest(BaseModel):
     questions: Optional[List[Dict]] = None  # Full questions for verification and storage
     parent_attempt_id: Optional[int] = None  # Set when this is a retake of a saved quiz
     name: Optional[str] = None  # Quiz name; used for first attempt only (retakes inherit from parent)
+    quiz_type: Optional[str] = 'practice'  # 'daily' awards XP/gems/streak; 'practice' is reward-free
 
 class QuizAttempt(BaseModel):
     """A single quiz attempt record"""
@@ -440,6 +441,44 @@ def init_database():
                 print(f"🔧 Backfilled XP for {len(totals)} user(s) from quiz_attempts")
             except Exception as _e:
                 print(f"⚠️ XP backfill failed (non-fatal): {_e}")
+
+        # Gems column (StarQuest §05). Spendable currency, separate from XP.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'gems'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN gems BIGINT NOT NULL DEFAULT 0 AFTER xp")
+            print("🔧 Added gems column to users")
+
+        # Per-user daily_goal (StarQuest §06). 10 / 15 / 20 cumulative correct per day.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'daily_goal'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN daily_goal SMALLINT NOT NULL DEFAULT 10 AFTER gems")
+            print("🔧 Added daily_goal column to users")
+
+        # user_rewards (StarQuest §05 — rewards shop). One row per redemption.
+        # UNIQUE(user_id, reward_id) enforces once-per-item from the catalogue.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_rewards (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                reward_id VARCHAR(64) NOT NULL,
+                cost INT NOT NULL,
+                redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                fulfilled_at TIMESTAMP NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uniq_user_reward (user_id, reward_id),
+                INDEX idx_user_rewards_user (user_id)
+            )
+        """)
 
         # Create quiz_attempts table for storing quiz history
         cursor.execute("""
@@ -1489,7 +1528,11 @@ async def signup(request: SignupRequest):
                     'email': request.email,
                     'name': request.name,
                     'avatar_url': None,
-                    'xp': 0,
+                    'xp':         0,
+                    'gems':       0,
+                    'daily_goal': 10,
+                    'level':      compute_level(0),
+                    'rank':       compute_rank(0),
                 }
             )
 
@@ -1517,7 +1560,7 @@ async def login(request: LoginRequest):
         try:
             # Find user by email
             cursor.execute(
-                "SELECT id, email, password_hash, name, avatar_url, xp FROM users WHERE email = %s",
+                "SELECT id, email, password_hash, name, avatar_url, xp, gems, daily_goal FROM users WHERE email = %s",
                 (request.email,)
             )
             user = cursor.fetchone()
@@ -1525,7 +1568,7 @@ async def login(request: LoginRequest):
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
-            user_id, email, password_hash, name, avatar_url, user_xp = user
+            user_id, email, password_hash, name, avatar_url, user_xp, user_gems, user_daily_goal = user
 
             # Verify password
             if not verify_password(request.password, password_hash):
@@ -1545,7 +1588,11 @@ async def login(request: LoginRequest):
                     'email': email,
                     'name': name,
                     'avatar_url': avatar_url,
-                    'xp': int(user_xp or 0),
+                    'xp':         int(user_xp or 0),
+                    'gems':       int(user_gems or 0),
+                    'daily_goal': int(user_daily_goal or 10),
+                    'level':      compute_level(user_xp or 0),
+                    'rank':       compute_rank(user_xp or 0),
                 }
             )
 
@@ -1583,7 +1630,7 @@ async def google_login(request: GoogleLoginRequest):
         try:
             # Check if user exists by google_id
             cursor.execute(
-                "SELECT id, email, name, avatar_url, xp FROM users WHERE google_id = %s",
+                "SELECT id, email, name, avatar_url, xp, gems, daily_goal FROM users WHERE google_id = %s",
                 (google_id,)
             )
             user = cursor.fetchone()
@@ -1591,19 +1638,19 @@ async def google_login(request: GoogleLoginRequest):
             avatar_url = None
             if user:
                 # Existing Google user
-                user_id, user_email, user_name, avatar_url, google_xp = user
+                user_id, user_email, user_name, avatar_url, google_xp, google_gems, google_daily_goal = user
                 print(f"✅ Google user logged in: {user_email}")
             else:
                 # Check if email exists (from other signup method)
                 cursor.execute(
-                    "SELECT id, name, avatar_url, xp FROM users WHERE email = %s",
+                    "SELECT id, name, avatar_url, xp, gems, daily_goal FROM users WHERE email = %s",
                     (email,)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Link Google account to existing email
-                    user_id, user_name, avatar_url, google_xp = existing
+                    user_id, user_name, avatar_url, google_xp, google_gems, google_daily_goal = existing
                     cursor.execute(
                         "UPDATE users SET google_id = %s WHERE id = %s",
                         (google_id, user_id)
@@ -1620,6 +1667,8 @@ async def google_login(request: GoogleLoginRequest):
                     user_id = cursor.lastrowid
                     user_name = name
                     google_xp = 0
+                    google_gems = 0
+                    google_daily_goal = 10
                     print(f"✅ New Google user registered: {email}")
 
             # Create JWT token
@@ -1634,7 +1683,11 @@ async def google_login(request: GoogleLoginRequest):
                     'email': email,
                     'name': user_name,
                     'avatar_url': avatar_url,
-                    'xp': int(google_xp or 0),
+                    'xp':         int(google_xp or 0),
+                    'gems':       int(google_gems or 0),
+                    'daily_goal': int(google_daily_goal or 10),
+                    'level':      compute_level(google_xp or 0),
+                    'rank':       compute_rank(google_xp or 0),
                 }
             )
 
@@ -1947,7 +2000,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 request.time_spent_seconds,
                 full_questions_json,
                 parent_attempt_id,
-                'practice',
+                (request.quiz_type or 'practice').lower(),
             ))
             conn.commit()
             attempt_id = cursor.lastrowid
@@ -1956,75 +2009,147 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
             print(f"✅ Quiz attempt saved ({kind}): user={user_id}, score={score}/{request.count}, "
                   f"time={request.time_spent_seconds}s, parent={parent_attempt_id}")
 
-            # Award XP first so daily_progress can also report the new total.
-            # Streak bonus uses the streak the user walked IN with — the very
-            # first qualifying quiz of a new streak gets no streak bonus.
-            xp_delta = 0
-            xp_total = 0
-            try:
-                cursor.execute(
-                    "SELECT current_streak FROM streaks WHERE user_id = %s",
-                    (user_id,),
-                )
-                _srow = cursor.fetchone()
-                pre_streak = int(_srow[0]) if _srow and _srow[0] is not None else 0
-                xp_delta = xp_for_quiz(score, request.difficulty, pre_streak)
-                if xp_delta > 0:
-                    cursor.execute(
-                        "UPDATE users SET xp = xp + %s WHERE id = %s",
-                        (xp_delta, user_id),
-                    )
-                    conn.commit()
-                cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
-                _xrow = cursor.fetchone()
-                xp_total = int(_xrow[0]) if _xrow and _xrow[0] is not None else 0
-            except Exception as _xe:
-                print(f"⚠️ XP award failed (non-fatal): {_xe}")
+            # Reward awards are DAILY-MODE ONLY. Practice quizzes (request.quiz_type
+            # != 'daily') save the attempt for retakes but grant no XP, no gems,
+            # and do NOT count toward the daily goal or streak.
+            is_daily = ((request.quiz_type or 'practice').lower() == 'daily')
 
-            # Credit toward today's cumulative correct target. Every practice quiz
-            # counts; hitting DAILY_CORRECT_TARGET correct in a day earns the streak.
+            # Defaults — used by practice and as fall-throughs if any daily branch errors.
+            xp_breakdown   = {"base": 0, "perfect": 0, "diff_mult": 1.0,
+                              "daily_goal": 0, "streak_milestone": 0}
+            xp_base        = 0
+            xp_perfect     = 0
+            xp_pre         = 0
+            xp_delta       = 0
+            xp_total       = 0
+            rank_up        = False
+            new_rank       = None
+            gems_delta     = 0
+            gems_total     = 0
+            gems_breakdown = {"correct": 0, "quiz": 0, "rank_up": 0}
             daily_progress = None
             streak_awarded = False
-            try:
-                today_d = _sg_today()
-                # Single-subject for now; broaden when multi-subject lands.
-                _daily_subject = 'Physics'
-                _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
-                    cursor, conn, user_id, _daily_subject, today_d, score, request.count
-                )
-                _current_streak = None
-                _longest_streak = None
-                _freeze_used = False
-                if _now_p and not _prev_p:
-                    _current_streak, _longest_streak, _freezes, _freeze_used = _award_streak_day(
-                        cursor, conn, user_id, today_d
-                    )
-                    streak_awarded = True
-                else:
-                    # Even when nothing was awarded, send the latest streak counts
-                    # so the UI always has the truth.
+            user_daily_goal = DAILY_CORRECT_TARGET
+
+            if is_daily:
+                # XP base + perfect-score bonus.
+                xp_breakdown = xp_for_quiz(score, request.count, request.difficulty)
+                xp_base    = xp_breakdown["base"]
+                xp_perfect = xp_breakdown["perfect"]
+
+                # Pre-submit XP snapshot for rank-up detection.
+                try:
+                    cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
+                    _r = cursor.fetchone()
+                    xp_pre = int(_r[0]) if _r and _r[0] is not None else 0
+                except Exception:
+                    xp_pre = 0
+
+                # Daily-progress credit + streak award.
+                try:
+                    today_d = _sg_today()
+                    _daily_subject = 'Physics'
                     try:
-                        cursor.execute(
-                            "SELECT current_streak, longest_streak FROM streaks WHERE user_id = %s",
-                            (user_id,),
-                        )
-                        _srow = cursor.fetchone()
-                        if _srow:
-                            _current_streak, _longest_streak = _srow[0], _srow[1]
+                        cursor.execute("SELECT daily_goal FROM users WHERE id = %s", (user_id,))
+                        _gr = cursor.fetchone()
+                        user_daily_goal = int(_gr[0]) if _gr and _gr[0] else DAILY_CORRECT_TARGET
                     except Exception:
-                        pass
-                daily_progress = {
-                    'today_correct': _today_correct,
-                    'target': DAILY_CORRECT_TARGET,
-                    'today_total': _today_total,
-                    'passed_today': _now_p,
-                    'streak_awarded': streak_awarded,
-                    'freeze_used': _freeze_used,
-                    'current_streak': _current_streak,
-                    'longest_streak': _longest_streak,
-                }
-            except Exception as _e:
-                print(f"\u26a0\ufe0f Daily-progress credit failed (non-fatal): {_e}")
+                        user_daily_goal = DAILY_CORRECT_TARGET
+                    _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
+                        cursor, conn, user_id, _daily_subject, today_d, score, request.count,
+                        target=user_daily_goal,
+                    )
+                    _current_streak = None
+                    _longest_streak = None
+                    _freeze_used = False
+                    if _now_p and not _prev_p:
+                        _current_streak, _longest_streak, _freezes, _freeze_used = _award_streak_day(
+                            cursor, conn, user_id, today_d
+                        )
+                        streak_awarded = True
+                    else:
+                        try:
+                            cursor.execute(
+                                "SELECT current_streak, longest_streak FROM streaks WHERE user_id = %s",
+                                (user_id,),
+                            )
+                            _srow = cursor.fetchone()
+                            if _srow:
+                                _current_streak, _longest_streak = _srow[0], _srow[1]
+                        except Exception:
+                            pass
+                    daily_progress = {
+                        'today_correct': _today_correct,
+                        'target': user_daily_goal,
+                        'today_total': _today_total,
+                        'passed_today': _now_p,
+                        'streak_awarded': streak_awarded,
+                        'freeze_used': _freeze_used,
+                        'current_streak': _current_streak,
+                        'longest_streak': _longest_streak,
+                    }
+                except Exception as _e:
+                    print(f"\u26a0\ufe0f Daily-progress credit failed (non-fatal): {_e}")
+
+                # StarQuest bonuses that depend on daily/streak state.
+                xp_daily_goal = XP_BONUS_DAILY_GOAL if streak_awarded else 0
+                xp_streak_milestone = 0
+                if streak_awarded and _current_streak and _current_streak > 0 \
+                        and _current_streak % XP_BONUS_STREAK_EVERY == 0:
+                    xp_streak_milestone = XP_BONUS_STREAK_AMOUNT
+
+                xp_breakdown.update({
+                    "daily_goal":       xp_daily_goal,
+                    "streak_milestone": xp_streak_milestone,
+                })
+                xp_delta = xp_base + xp_perfect + xp_daily_goal + xp_streak_milestone
+
+                # XP commit + rank-up detection.
+                xp_total = xp_pre
+                try:
+                    if xp_delta > 0:
+                        cursor.execute(
+                            "UPDATE users SET xp = xp + %s WHERE id = %s",
+                            (xp_delta, user_id),
+                        )
+                        conn.commit()
+                    cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
+                    _xp = cursor.fetchone()
+                    xp_total = int(_xp[0]) if _xp and _xp[0] is not None else 0
+
+                    pre_rank  = compute_rank(xp_pre)
+                    post_rank = compute_rank(xp_total)
+                    if post_rank["tier_index"] > pre_rank["tier_index"]:
+                        rank_up  = True
+                        new_rank = post_rank
+                except Exception as _xe:
+                    print(f"\u26a0\ufe0f XP award failed (non-fatal): {_xe}")
+
+                # Gem award.
+                gems_delta, gems_breakdown = gems_for_quiz(score, rank_up)
+                try:
+                    if gems_delta > 0:
+                        cursor.execute("UPDATE users SET gems = gems + %s WHERE id = %s",
+                                       (gems_delta, user_id))
+                        conn.commit()
+                    cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+                    _gr2 = cursor.fetchone()
+                    gems_total = int(_gr2[0]) if _gr2 and _gr2[0] is not None else 0
+                except Exception as _ge:
+                    print(f"\u26a0\ufe0f Gem award failed (non-fatal): {_ge}")
+            else:
+                # Practice: still report the current XP/gems balance so the UI stays accurate,
+                # but never modify either column.
+                try:
+                    cursor.execute("SELECT xp, gems FROM users WHERE id = %s", (user_id,))
+                    _r = cursor.fetchone()
+                    xp_total   = int(_r[0]) if _r and _r[0] is not None else 0
+                    gems_total = int(_r[1]) if _r and _r[1] is not None else 0
+                    xp_pre = xp_total
+                except Exception:
+                    pass
+
+            progression = compute_progression(xp_total)
 
             return {
                 'success': True,
@@ -2034,8 +2159,16 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 'total_questions': request.count,
                 'message': f'Quiz saved! You scored {score}/{request.count} ({percentage}%)',
                 'daily_progress': daily_progress,
-                'xp_delta': xp_delta,
-                'xp_total': xp_total,
+                'xp_delta':       xp_delta,
+                'xp_total':       xp_total,
+                'xp_breakdown':   xp_breakdown,
+                'gems_delta':     gems_delta,
+                'gems_total':     gems_total,
+                'gems_breakdown': gems_breakdown,
+                'progression':    progression,
+                'daily_goal':     user_daily_goal,
+                'rank_up':        rank_up,
+                'new_rank':       new_rank,
             }
 
         finally:
@@ -2864,7 +2997,37 @@ async def get_user_ranks(authorization: str = Header(None)):
             }
             for r in rows
         ]
-        return {"ranks": ranks, "has_placement": len(ranks) > 0}
+        # StarQuest progression (XP/Level/Rank) — included alongside the legacy
+        # per-subject placement bands so a single request hydrates both the
+        # placement gate AND the user-facing rank display.
+        try:
+            conn2 = get_db_connection()
+            cursor2 = conn2.cursor()
+            try:
+                cursor2.execute("SELECT xp, gems, daily_goal FROM users WHERE id = %s", (user_id,))
+                _xr = cursor2.fetchone()
+                _xp   = int(_xr[0]) if _xr and _xr[0] is not None else 0
+                _gems = int(_xr[1]) if _xr and _xr[1] is not None else 0
+                _goal = int(_xr[2]) if _xr and _xr[2] is not None else 10
+                # Freeze count: 0 if no streak row yet.
+                cursor2.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
+                _fr = cursor2.fetchone()
+                _freezes = int(_fr[0]) if _fr and _fr[0] is not None else 0
+            finally:
+                cursor2.close()
+                conn2.close()
+        except Exception:
+            _xp, _gems, _goal, _freezes = 0, 0, 10, 0
+
+        return {
+            "ranks":             ranks,
+            "has_placement":     len(ranks) > 0,
+            "progression":       compute_progression(_xp),
+            "gems":              _gems,
+            "daily_goal":        _goal,
+            "freezes_available": _freezes,
+            "freeze_cap":        GEMS_FREEZE_CAP,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -2886,27 +3049,106 @@ DAILY_CORRECT_TARGET = 10  # cumulative correct answers needed in a day to earn 
 
 
 # ---------------------------------------------------------------------------
-# XP system (Phase 3 leaderboard). Formula:
-#   xp_award = round(correct * BASE * difficulty_mult * streak_mult)
-#   streak_mult = 1 + min(streak, 30) * 0.02   (caps at +60% on 30-day streak)
-# Difficulty multipliers mirror what the Practice UI advertises.
+# XP economy (StarQuest §01). XP is permanent, awarded only from quizzes.
+# Earning sources:
+#   correct        +10   (per question)
+#   wrong           0
+#   perfect bonus  +20   (100% on a quiz of >=3 questions)
+#   daily-goal     +15   (1x per day, when DAILY_CORRECT_TARGET is crossed)
+#   streak milestone +50 (every 7 streak days)
+# Difficulty multiplier applies to the base only (correct * 10), not to bonuses.
 # ---------------------------------------------------------------------------
-XP_BASE_PER_CORRECT = 10
-XP_DIFFICULTY_MULT = {"easy": 0.5, "medium": 1.5, "hard": 2.0}
-XP_STREAK_CAP_DAYS = 30
-XP_STREAK_PER_DAY  = 0.02
+XP_BASE_PER_CORRECT     = 10
+XP_DIFFICULTY_MULT      = {"easy": 1.0, "medium": 1.25, "hard": 1.5}
+XP_BONUS_PERFECT        = 20
+XP_BONUS_PERFECT_MIN_QS = 3
+XP_BONUS_DAILY_GOAL     = 15
+XP_BONUS_STREAK_AMOUNT  = 50
+XP_BONUS_STREAK_EVERY   = 7
 
 
-def xp_for_quiz(correct, difficulty, current_streak):
-    """Compute the XP award for a single quiz submission. Pure function — safe
-    to call from anywhere. Always returns a non-negative int.
+def xp_for_quiz(correct, total, difficulty):
+    """Compute the XP breakdown for a quiz result.
+      base    = correct * 10 * difficulty_mult  (rounded)
+      perfect = 20 if 100% on >=3 questions else 0
+    Daily-goal and streak-milestone bonuses are layered by the caller because
+    they depend on cumulative state outside the quiz row.
     """
     correct = max(0, int(correct or 0))
-    diff_key = (difficulty or '').strip().lower()
+    total   = max(0, int(total or 0))
+    diff_key = (difficulty or "").strip().lower()
     diff_mult = XP_DIFFICULTY_MULT.get(diff_key, 1.0)
-    streak    = max(0, int(current_streak or 0))
-    streak_mult = 1.0 + min(streak, XP_STREAK_CAP_DAYS) * XP_STREAK_PER_DAY
-    return int(round(correct * XP_BASE_PER_CORRECT * diff_mult * streak_mult))
+    base = int(round(correct * XP_BASE_PER_CORRECT * diff_mult))
+    perfect = XP_BONUS_PERFECT if (total >= XP_BONUS_PERFECT_MIN_QS and correct == total and correct > 0) else 0
+    return {"base": base, "perfect": perfect, "diff_mult": diff_mult}
+
+
+# StarQuest §02 — Level: pure XP/50 staircase, derived (no schema).
+def compute_level(xp):
+    return int(max(0, int(xp or 0)) // 50) + 1
+
+
+# StarQuest §03 — Rank tiers. XP-derived; replaces F9..A1 in the UI display.
+STARQUEST_RANKS = [
+    {"key": "cadet",        "name": "Cadet",        "xp_min":    0, "icon": "✨"},
+    {"key": "pilot",        "name": "Pilot",        "xp_min":  200, "icon": "🚀"},
+    {"key": "navigator",    "name": "Navigator",    "xp_min":  500, "icon": "🧭"},
+    {"key": "commander",    "name": "Commander",    "xp_min": 1200, "icon": "🎖"},
+    {"key": "captain",      "name": "Captain",      "xp_min": 2500, "icon": "🌟"},
+    {"key": "star_admiral", "name": "Star Admiral", "xp_min": 5000, "icon": "⭐"},
+]
+
+
+def compute_rank(xp):
+    """StarQuest rank dict. Carries both modern keys (name/icon) and legacy
+    aliases (tier_name/tier_icon/rank_band) so existing components keep rendering."""
+    xp = max(0, int(xp or 0))
+    idx = 0
+    for i, t in enumerate(STARQUEST_RANKS):
+        if xp >= t["xp_min"]:
+            idx = i
+    cur = STARQUEST_RANKS[idx]
+    nxt = STARQUEST_RANKS[idx + 1] if idx + 1 < len(STARQUEST_RANKS) else None
+    return {
+        "tier_index": idx,
+        "key":        cur["key"],
+        "name":       cur["name"],
+        "icon":       cur["icon"],
+        "xp_min":     cur["xp_min"],
+        "xp_next":    nxt["xp_min"] if nxt else None,
+        "next_name":  nxt["name"]  if nxt else None,
+        "tier_name":  cur["name"],
+        "tier_icon":  cur["icon"],
+        "rank_band":  cur["key"],
+    }
+
+
+def compute_progression(xp):
+    xp = max(0, int(xp or 0))
+    return {"xp": xp, "level": compute_level(xp), "rank": compute_rank(xp)}
+
+
+# ---------------------------------------------------------------------------
+# StarQuest §05 — Crystals (gems). Spendable currency, earned with each quiz.
+#   correct        +2
+#   quiz completion +5  (once per submit, regardless of score)
+#   rank-up        +50
+#   weekly leaderboard top 1/2/3: +100/+60/+30  (Phase 2B)
+# ---------------------------------------------------------------------------
+GEMS_PER_CORRECT = 2
+GEMS_PER_QUIZ    = 5
+GEMS_RANK_UP     = 50
+GEMS_FREEZE_COST = 30
+GEMS_FREEZE_CAP  = 2
+
+
+def gems_for_quiz(correct, rank_up):
+    """Pure helper: (delta, breakdown_dict). Mirrors xp_for_quiz's shape."""
+    correct = max(0, int(correct or 0))
+    g_correct = correct * GEMS_PER_CORRECT
+    g_quiz    = GEMS_PER_QUIZ
+    g_rankup  = GEMS_RANK_UP if rank_up else 0
+    return g_correct + g_quiz + g_rankup, {"correct": g_correct, "quiz": g_quiz, "rank_up": g_rankup}
 
 
 def _award_streak_day(cursor, conn, user_id, today):
@@ -2938,10 +3180,11 @@ def _award_streak_day(cursor, conn, user_id, today):
     else:
         current_streak, longest_streak, last_qualified, freezes, freeze_granted, freeze_used_date = srow
 
-    # Calendar-week freeze regen: hard reset to 1 on new ISO week (Mon-Sun).
-    # No stacking — even an unused freeze from last week is replaced.
+    # Hybrid freeze policy: every ISO week the user gets +1 free freeze
+    # (capped at GEMS_FREEZE_CAP). They can also buy +1 via /api/freeze/purchase,
+    # subject to the same cap. Unused freezes carry across weeks until cap.
     if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
-        freezes = 1
+        freezes = min(GEMS_FREEZE_CAP, (freezes or 0) + 1)
         freeze_granted = today
 
     freeze_used = False
@@ -2977,9 +3220,13 @@ def _award_streak_day(cursor, conn, user_id, today):
     return current_streak, longest_streak, freezes, freeze_used
 
 
-def _credit_daily_practice(cursor, conn, user_id, subject, today, correct, total):
+def _credit_daily_practice(cursor, conn, user_id, subject, today, correct, total, target=None):
     """Add today's quiz result into the daily cumulative tally.
+    `target` defaults to DAILY_CORRECT_TARGET if not supplied; in normal use
+    the caller passes the user's configured daily_goal so 10/15/20 are honored.
     Returns (prev_passed, now_passed, today_correct, today_total)."""
+    if target is None:
+        target = DAILY_CORRECT_TARGET
     cursor.execute(
         "SELECT score, total, passed FROM daily_challenges "
         "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
@@ -2993,7 +3240,7 @@ def _credit_daily_practice(cursor, conn, user_id, subject, today, correct, total
     new_correct = prev_correct + max(0, int(correct or 0))
     new_total   = prev_total + max(0, int(total or 0))
     new_pct     = round(100 * new_correct / new_total) if new_total else 0
-    new_passed  = new_correct >= DAILY_CORRECT_TARGET
+    new_passed  = new_correct >= target
 
     if row:
         cursor.execute(
@@ -3043,9 +3290,9 @@ def _lazy_streak_maintenance(cursor, conn, user_id, today):
 
     dirty = False
 
-    # 1. Weekly freeze regen (Mon–Sun, ISO). Hard reset to 1 — no stacking.
+    # Hybrid freeze policy: weekly +1 grant on read, capped at GEMS_FREEZE_CAP.
     if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
-        freezes = 1
+        freezes = min(GEMS_FREEZE_CAP, (freezes or 0) + 1)
         freeze_granted = today
         dirty = True
 
@@ -3723,6 +3970,8 @@ async def get_leaderboard(
                 prev_score = score
             else:
                 rank = prev_rank
+            # Level is only meaningful when score IS the all-time XP total.
+            level = compute_level(score) if period == "alltime" else None
             full.append({
                 "user_id":    int(uid),
                 "name":       name,
@@ -3730,6 +3979,7 @@ async def get_leaderboard(
                 "score":      score,
                 "rank":       rank,
                 "is_me":      int(uid) == me_id,
+                "level":      level,
             })
 
         top = full[: max(1, int(limit))]
@@ -3754,9 +4004,358 @@ async def get_leaderboard(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+class DailyGoalUpdateRequest(BaseModel):
+    goal: int  # must be 10 / 15 / 20
+
+
+@app.patch("/api/profile/daily-goal")
+async def set_daily_goal(request: DailyGoalUpdateRequest, authorization: str = Header(None)):
+    """Set the user's daily goal (10 / 15 / 20). StarQuest §06."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+        goal = int(request.goal)
+        if goal not in (10, 15, 20):
+            raise HTTPException(status_code=400, detail="daily_goal must be 10, 15, or 20")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE users SET daily_goal = %s WHERE id = %s", (goal, user_id))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "daily_goal": goal}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/profile/daily-goal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/freeze/purchase")
+async def purchase_freeze(authorization: str = Header(None)):
+    """Spend GEMS_FREEZE_COST gems to add 1 streak freeze. Cap at GEMS_FREEZE_CAP."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            gems_have = int(row[0]) if row and row[0] is not None else 0
+            if gems_have < GEMS_FREEZE_COST:
+                raise HTTPException(status_code=400,
+                    detail=f"Need {GEMS_FREEZE_COST} gems, have {gems_have}")
+
+            cursor.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
+            srow = cursor.fetchone()
+            freezes_have = int(srow[0]) if srow and srow[0] is not None else 0
+            if freezes_have >= GEMS_FREEZE_CAP:
+                raise HTTPException(status_code=400,
+                    detail=f"Freeze cap reached ({GEMS_FREEZE_CAP}). Use one before buying another.")
+
+            # Spend gems + grant freeze.
+            cursor.execute("UPDATE users SET gems = gems - %s WHERE id = %s",
+                           (GEMS_FREEZE_COST, user_id))
+            if not srow:
+                # No streaks row yet — bootstrap one with this freeze counting as freeze #1.
+                cursor.execute(
+                    "INSERT INTO streaks (user_id, current_streak, longest_streak, "
+                    "freezes_available, freeze_last_granted) VALUES (%s, 0, 0, 1, %s)",
+                    (user_id, _sg_today()),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE streaks SET freezes_available = freezes_available + 1 WHERE user_id = %s",
+                    (user_id,),
+                )
+            conn.commit()
+
+            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+            gems_after = int(cursor.fetchone()[0])
+            cursor.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
+            freezes_after = int(cursor.fetchone()[0])
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "success":           True,
+            "gems_spent":        GEMS_FREEZE_COST,
+            "gems_total":        gems_after,
+            "freezes_available": freezes_after,
+            "freeze_cap":        GEMS_FREEZE_CAP,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/freeze/purchase: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ---------------------------------------------------------------------------
+# StarQuest §05 — Rewards Shop. Static catalogue, mirrors newFrontend/index.html.
+# Costs are in gems. Physical items are mailed monthly to school; digital
+# items (avatars) unlock instantly.
+# ---------------------------------------------------------------------------
+SHOP_CATALOGUE = [
+    {"id": "sticker_pack",   "name": "CuriousLab Sticker Pack",  "cost": 50,  "emoji": "🌟", "type": "physical", "desc": "Physical sticker pack mailed to you."},
+    {"id": "bookmark",       "name": "Holographic Bookmark",     "cost": 80,  "emoji": "🔖", "type": "physical", "desc": "Limited edition CuriousLab bookmark."},
+    {"id": "avatar_dragon",  "name": "Dragon Avatar",            "cost": 120, "emoji": "🐉", "type": "avatar",   "desc": "Unlock a rare avatar.", "value": "🐉"},
+    {"id": "notebook",       "name": "Curious Notebook",         "cost": 150, "emoji": "📓", "type": "physical", "desc": "A5 dotted notebook with formula reference."},
+    {"id": "bubble_tea",     "name": "Bubble Tea Voucher",       "cost": 200, "emoji": "🧋", "type": "physical", "desc": "$8 voucher at participating shops."},
+    {"id": "avatar_astro",   "name": "Astronaut Avatar",         "cost": 250, "emoji": "🧑‍🚀", "type": "avatar",   "desc": "Unlock a rare avatar.", "value": "🧑‍🚀"},
+    {"id": "tshirt",         "name": "CuriousLab T-Shirt",       "cost": 400, "emoji": "👕", "type": "physical", "desc": "Premium cotton tee. Pick size on redeem."},
+    {"id": "tuition_credit", "name": "1 Free Tuition Session",   "cost": 800, "emoji": "🎓", "type": "high-tier","desc": "One free 1-on-1 CuriousLab session."},
+]
+SHOP_BY_ID = {item["id"]: item for item in SHOP_CATALOGUE}
+
+
+@app.get("/api/shop")
+async def get_shop(authorization: str = Header(None)):
+    """Return the shop catalogue + the user's gem balance + their owned reward IDs."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            gems = int(row[0]) if row and row[0] is not None else 0
+
+            cursor.execute(
+                "SELECT reward_id FROM user_rewards WHERE user_id = %s ORDER BY redeemed_at DESC",
+                (user_id,),
+            )
+            owned = [r[0] for r in cursor.fetchall()]
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "gems":      gems,
+            "owned":     owned,
+            "catalogue": SHOP_CATALOGUE,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/shop: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ShopRedeemRequest(BaseModel):
+    reward_id: str
+
+
+@app.post("/api/shop/redeem")
+async def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(None)):
+    """Spend gems to redeem one catalogue item. Idempotent-ish: UNIQUE constraint
+    blocks double-redemption of the same item (returns 400 with a clear message)."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        item = SHOP_BY_ID.get(request.reward_id)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Unknown reward: {request.reward_id}")
+        cost = int(item["cost"])
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Check balance + ownership inside the same transaction.
+            cursor.execute("SELECT gems FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            row = cursor.fetchone()
+            gems_have = int(row[0]) if row and row[0] is not None else 0
+            if gems_have < cost:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Need {cost} gems, have {gems_have}",
+                )
+
+            cursor.execute(
+                "SELECT 1 FROM user_rewards WHERE user_id = %s AND reward_id = %s",
+                (user_id, item["id"]),
+            )
+            if cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Already owned")
+
+            cursor.execute(
+                "UPDATE users SET gems = gems - %s WHERE id = %s",
+                (cost, user_id),
+            )
+            cursor.execute(
+                "INSERT INTO user_rewards (user_id, reward_id, cost) VALUES (%s, %s, %s)",
+                (user_id, item["id"], cost),
+            )
+            conn.commit()
+
+            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+            gems_after = int(cursor.fetchone()[0])
+        except HTTPException:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {
+            "success":    True,
+            "reward":     item,
+            "gems_spent": cost,
+            "gems_total": gems_after,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/shop/redeem: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============================================================================
 # TEMPORARY — STREAK TEST ENDPOINTS (delete before production hardening)
 # ============================================================================
+
+class TestXpGrantRequest(BaseModel):
+    amount: int  # may be negative to take XP away (won't go below 0)
+
+
+@app.post("/api/test/xp-grant")
+async def test_xp_grant(request: TestXpGrantRequest, authorization: str = Header(None)):
+    """TEMPORARY — grant or revoke XP. Detects rank-up + level change so the
+    panel can fire a celebration. Returns the same shape as /api/quiz/submit
+    so the frontend can reuse the rewards renderer."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+        delta = int(request.amount)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            xp_pre = int(row[0]) if row and row[0] is not None else 0
+            xp_post = max(0, xp_pre + delta)
+
+            cursor.execute("UPDATE users SET xp = %s WHERE id = %s", (xp_post, user_id))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+        pre_rank  = compute_rank(xp_pre)
+        post_rank = compute_rank(xp_post)
+        return {
+            "success":     True,
+            "xp_delta":    xp_post - xp_pre,
+            "xp_pre":      xp_pre,
+            "xp_total":    xp_post,
+            "progression": compute_progression(xp_post),
+            "rank_up":     post_rank["tier_index"] > pre_rank["tier_index"],
+            "rank_down":   post_rank["tier_index"] < pre_rank["tier_index"],
+            "new_rank":    post_rank,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/test/xp-grant: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TestGemsGrantRequest(BaseModel):
+    amount: int
+
+
+@app.post("/api/test/gems-grant")
+async def test_gems_grant(request: TestGemsGrantRequest, authorization: str = Header(None)):
+    """TEMPORARY — grant or revoke gems (clamped at 0)."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+        delta = int(request.amount)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            pre = int(row[0]) if row and row[0] is not None else 0
+            post = max(0, pre + delta)
+            cursor.execute("UPDATE users SET gems = %s WHERE id = %s", (post, user_id))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "gems_delta": post - pre, "gems_total": post}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/test/gems-grant: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/test/progression-reset")
+async def test_progression_reset(authorization: str = Header(None)):
+    """TEMPORARY — set xp=0 and gems=0 for the current user. Streaks/rewards
+    are NOT touched — use /api/test/streak-reset for those."""
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE users SET xp = 0, gems = 0 WHERE id = %s", (user_id,))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        return {"success": True, "xp_total": 0, "gems_total": 0,
+                "progression": compute_progression(0)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/test/progression-reset: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 class TestStreakCreditRequest(BaseModel):
     # 'next'    = day AFTER last_qualified (or today if no streak yet) — clean advance
