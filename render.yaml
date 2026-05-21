@@ -2,7 +2,7 @@
 # Docs: https://render.com/docs/blueprint-spec
 services:
   - type: web
-    name: quiz-backend
+    name: habitgo-api
     runtime: python
     region: singapore
     plan: starter            # $7/mo, no cold starts

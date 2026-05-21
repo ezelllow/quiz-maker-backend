@@ -1,5 +1,5 @@
 """
-Quiz Maker Backend - FastAPI
+HabitGo Backend - FastAPI
 Fetches questions from Google Sheet, images from Google Drive
 Returns filtered quizzes based on difficulty, subtopic, and count
 """
@@ -302,9 +302,14 @@ def parse_option_type(options_str: str) -> Tuple[str, str, Optional[List], Optio
                 data_started = True
 
             if not data_started:
-                # This is a header row
+                # This is a header row. Drop empty cells produced by
+                # surrounding pipes (| a | b |) and the leading blank
+                # "option-letter" column, so flat_headers lines up 1:1 with
+                # each data row's values.
                 header_parts = [h.strip() for h in line.split('|')]
-                header_rows.append(header_parts)
+                header_parts = [h for h in header_parts if h]
+                if header_parts:
+                    header_rows.append(header_parts)
             else:
                 # Parse data row
                 if is_data_row:
@@ -328,6 +333,10 @@ def parse_option_type(options_str: str) -> Tuple[str, str, Optional[List], Optio
                             row_data[header] = parts[j]
 
                     row_data['_letter'] = letter
+                    # Positional cell values (letter prefix stripped) so the
+                    # frontend can render the row even when the table has no
+                    # header row to key the values by.
+                    row_data['_cells'] = [value] + parts[1:]
                     table_rows.append(row_data)
 
         # Determine header format
@@ -463,6 +472,18 @@ def init_database():
         if cursor.fetchone()[0] == 0:
             cursor.execute("ALTER TABLE users ADD COLUMN daily_goal SMALLINT NOT NULL DEFAULT 10 AFTER gems")
             print("🔧 Added daily_goal column to users")
+
+        # Dev-tools simulated clock — day offset for the streak test panel.
+        # Always 0 in production; the test panel bumps it to fast-forward days.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'test_day_offset'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN test_day_offset INT NOT NULL DEFAULT 0 AFTER daily_goal")
+            print("🔧 Added test_day_offset column to users")
 
         # user_rewards (StarQuest §05 — rewards shop). One row per redemption.
         # UNIQUE(user_id, reward_id) enforces once-per-item from the catalogue.
@@ -601,6 +622,7 @@ def init_database():
                 percentage INT NOT NULL,
                 passed BOOLEAN DEFAULT FALSE,
                 attempts INT DEFAULT 1,
+                xp BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -608,6 +630,17 @@ def init_database():
                 INDEX idx_dc_user_subject (user_id, subject)
             )
         """)
+
+        # Per-day XP earned — drives the daily / weekly leaderboards.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'daily_challenges'
+              AND COLUMN_NAME = 'xp'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE daily_challenges ADD COLUMN xp BIGINT NOT NULL DEFAULT 0 AFTER attempts")
+            print("🔧 Added xp column to daily_challenges")
 
         # Create user_subject_ranks table (Phase 1 ranking system)
         cursor.execute("""
@@ -830,9 +863,17 @@ class QuestionCache:
                         print(f"       diagram_file_id='{diagram_file_id}'")
                         # Extract main question UID (remove -setup suffix)
                         main_uid = uid.replace('-setup', '')
+                        # The setup diagram normally comes from the Diagram column.
+                        # Some setup rows instead declare it in the Options column
+                        # as "IMAGE:<uid>" -- fall back to that so the diagram is
+                        # not silently dropped.
+                        setup_file_id = diagram_file_id
+                        if not setup_file_id and options.upper().startswith('IMAGE:'):
+                            setup_file_id = options.split(':', 1)[1].strip()
+                            print(f"       diagram from Options IMAGE ref: {setup_file_id}")
                         self.setup_info_map[main_uid] = {
                             'text': question_text,
-                            'file_id': diagram_file_id  # Can be None
+                            'file_id': setup_file_id  # Can be None
                         }
                         print(f"       ✅ MAPPED: {main_uid}")
                         continue  # Skip adding setup row as a question
@@ -889,18 +930,19 @@ class QuestionCache:
 
         # If it looks like a real Google Drive file ID (contains hyphen/underscore, mostly alphanumeric)
         # and exists in file_map as a key, it's a file ID
-        if potential_file_id in self.file_map:
-            result = self.file_map[potential_file_id]
-            print(f"      [resolve_file_id] Found exact match: {result}")
-            return result
-
-        # Try with extensions
-        for ext in ['.png', '.jpg', '.jpeg', '.gif']:
-            filename = potential_file_id + ext
-            if filename in self.file_map:
-                result = self.file_map[filename]
-                print(f"      [resolve_file_id] Found with extension {ext}: {result}")
+        # Try exact then lowercase, with and without common extensions.
+        # file_map holds both original- and lower-case keys, so checking the
+        # lowercased form makes the whole lookup case-insensitive.
+        for base in [potential_file_id, potential_file_id.lower()]:
+            if base in self.file_map:
+                result = self.file_map[base]
+                print(f"      [resolve_file_id] Found match: {result}")
                 return result
+            for ext in ['.png', '.jpg', '.jpeg', '.gif']:
+                if base + ext in self.file_map:
+                    result = self.file_map[base + ext]
+                    print(f"      [resolve_file_id] Found with extension {ext}: {result}")
+                    return result
 
         # If nothing found, assume it's already a file ID
         # (might be one that doesn't exist in our folder)
@@ -1011,9 +1053,15 @@ class QuestionCache:
         if subtopic:
             filtered = [q for q in filtered if q.subtopic.lower() == subtopic.lower()]
 
-        # Filter by level (stream/subject)
+        # Filter by level. Accepts the 'pure' / 'nonpure' category keywords
+        # (non-pure == the sheet's '4E5N') or an exact Level value.
         if level:
-            filtered = [q for q in filtered if q.level and q.level.lower() == level.lower()]
+            lv = str(level).strip().lower()
+            if lv in ('pure', 'nonpure', 'non-pure', 'combined'):
+                want_nonpure = lv != 'pure'
+                filtered = [q for q in filtered if _is_nonpure(q.level) == want_nonpure]
+            else:
+                filtered = [q for q in filtered if q.level and q.level.lower() == lv]
 
         # Filter by subject (Physics, Math, ...)
         if subject:
@@ -1086,7 +1134,7 @@ def get_category_statistics() -> dict:
 # ============================================================================
 
 app = FastAPI(
-    title="Quiz Maker API",
+    title="HabitGo API",
     description="Create filtered quizzes from Google Sheet database",
     version="1.0.0"
 )
@@ -1115,19 +1163,108 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "ok", "questions_loaded": cache.is_loaded}
 
-@app.get("/api/subtopics", response_model=List[str])
-async def get_subtopics():
-    """Get all available subtopics"""
-    try:
-        print(f"📌 /api/subtopics called. Cache loaded: {cache.is_loaded}, Questions count: {len(cache.questions)}")
+# 6091 Physics (O-Level) syllabus topic sequences. Pure and Combined physics
+# have different topic sets / orders; these drive the build-form filter order.
+PURE_TOPIC_ORDER = [
+    "Physical Quantities, Units and Measurement",
+    "Kinematics",
+    "Dynamics",
+    "Turning Effect of Forces",
+    "Pressure",
+    "Energy",
+    "Kinetic Particle Model of Matter",
+    "Thermal Processes",
+    "Thermal Properties of Matter",
+    "General Properties of Waves",
+    "Electromagnetic Spectrum",
+    "Light",
+    "Static Electricity",
+    "Current of Electricity",
+    "D.C. Circuits",
+    "Practical Electricity",
+    "Magnetism",
+    "Electromagnetism",
+    "Electromagnetic Induction",
+    "Radioactivity",
+]
 
-        # Ensure questions are loaded
+COMBINED_TOPIC_ORDER = [
+    "Physical Quantities, Units and Measurement",
+    "Kinematics",
+    "Force and Pressure",
+    "Dynamics",
+    "Turning Effect of Forces",
+    "Energy",
+    "Kinetic Particle Model of Matter",
+    "Thermal Processes",
+    "General Wave Properties",
+    "Electromagnetic Spectrum",
+    "Light",
+    "Electric Charge and Current of Electricity",
+    "D.C. Circuits",
+    "Practical Electricity",
+    "Magnetism and Electromagnetism",
+    "Radioactivity",
+]
+
+
+def _norm_topic(name):
+    """Normalise a topic name for matching: strip a leading number prefix
+    (e.g. "2. Kinematics"), lowercase, trim."""
+    s = str(name).strip()
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i > 0:
+        rest = s[i:].lstrip(".) ")
+        if rest:
+            s = rest
+    return s.strip().lower()
+
+
+def _topic_sort_key(name, order):
+    """Sort key placing topics in the given syllabus `order`. Unknown topics
+    fall to the end, alphabetically."""
+    key = _norm_topic(name)
+    for idx, canon in enumerate(order):
+        if _norm_topic(canon) == key:
+            return (idx, key)
+    return (len(order), key)
+
+
+def _is_nonpure(level_value):
+    """Non-pure physics is labelled '4E5N' in the sheet's Level column.
+    Everything else counts as pure physics."""
+    return '4e5n' in str(level_value or '').strip().lower()
+
+
+@app.get("/api/subtopics", response_model=List[str])
+async def get_subtopics(level: str = None):
+    """Available topics, optionally filtered to one physics level.
+    `level` = 'pure' or 'nonpure' (non-pure == the sheet's '4E5N' Level)."""
+    try:
         if not cache.is_loaded:
-            print("  ⚠️  Cache not loaded, loading now...")
             cache.load_questions()
 
-        subtopics = cache.get_unique_subtopics()
-        print(f"  ✅ Returning {len(subtopics)} subtopics: {subtopics[:5]}...")
+        cat = (level or '').strip().lower()
+        if cat in ('pure', 'nonpure', 'non-pure', 'combined'):
+            want_nonpure = cat != 'pure'
+            order = COMBINED_TOPIC_ORDER if want_nonpure else PURE_TOPIC_ORDER
+            order_norms = {_norm_topic(c) for c in order}
+            # Only surface topics that belong to the chosen syllabus — any
+            # other topic value in the sheet is dropped from the filter.
+            seen = set()
+            for q in cache.questions:
+                if (q.subtopic and q.subtopic.lower() != 'question setup'
+                        and _is_nonpure(q.level) == want_nonpure
+                        and _norm_topic(q.subtopic) in order_norms):
+                    seen.add(q.subtopic)
+            subtopics = sorted(seen, key=lambda s: _topic_sort_key(s, order))
+        else:
+            subtopics = sorted(cache.get_unique_subtopics(),
+                               key=lambda s: _topic_sort_key(s, PURE_TOPIC_ORDER))
+
+        print(f"  ✅ /api/subtopics (level={cat or 'all'}) -> {len(subtopics)}")
         return subtopics
     except Exception as e:
         print(f"  ❌ Error in /api/subtopics: {e}")
@@ -1264,6 +1401,15 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                 level=request.level,
                 subject=request.subject,
             )
+            # "All topics" (no specific pick): restrict the pool to the chosen
+            # level's syllabus topics so irrelevant topics never leak in.
+            if not single_topic and request.level:
+                _lv = str(request.level).strip().lower()
+                if _lv in ('pure', 'nonpure', 'non-pure', 'combined'):
+                    _order = COMBINED_TOPIC_ORDER if _lv != 'pure' else PURE_TOPIC_ORDER
+                    _norms = {_norm_topic(c) for c in _order}
+                    filtered_questions = [q for q in filtered_questions
+                                          if _norm_topic(q.subtopic) in _norms]
             if not filtered_questions:
                 raise HTTPException(
                     status_code=400,
@@ -2047,14 +2193,10 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
 
                 # Daily-progress credit + streak award.
                 try:
-                    today_d = _sg_today()
+                    today_d = _effective_today(user_id)
                     _daily_subject = 'Physics'
-                    try:
-                        cursor.execute("SELECT daily_goal FROM users WHERE id = %s", (user_id,))
-                        _gr = cursor.fetchone()
-                        user_daily_goal = int(_gr[0]) if _gr and _gr[0] else DAILY_CORRECT_TARGET
-                    except Exception:
-                        user_daily_goal = DAILY_CORRECT_TARGET
+                    # Daily goal is fixed at 10 correct — no per-user setting.
+                    user_daily_goal = DAILY_CORRECT_TARGET
                     _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
                         cursor, conn, user_id, _daily_subject, today_d, score, request.count,
                         target=user_daily_goal,
@@ -2111,6 +2253,13 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                         cursor.execute(
                             "UPDATE users SET xp = xp + %s WHERE id = %s",
                             (xp_delta, user_id),
+                        )
+                        # Bank the same XP onto today's daily row so the
+                        # daily / weekly leaderboards can rank by XP.
+                        cursor.execute(
+                            "UPDATE daily_challenges SET xp = xp + %s "
+                            "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
+                            (xp_delta, user_id, _daily_subject, today_d),
                         )
                         conn.commit()
                     cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
@@ -2220,7 +2369,11 @@ async def get_quiz_history(
                 WHERE user_id = %s
             """
             if saved_only:
+                # Saved = original practice quizzes only. Exclude retakes AND
+                # daily-challenge attempts. Legacy rows with a NULL quiz_type
+                # predate the daily feature, so they count as practice.
                 sql += " AND parent_attempt_id IS NULL"
+                sql += " AND (quiz_type IS NULL OR quiz_type <> 'daily')"
             sql += " ORDER BY attempted_at DESC"
 
             cursor.execute(sql, (user_id,))
@@ -2593,6 +2746,9 @@ async def get_user_stats(authorization: str = Header(None)):
                     "accuracy_delta": None, "topics_improved": 0,
                     "topics_tracked": 0, "per_topic_trend": [],
                 },
+                "first_attempt_accuracy": 0,
+                "by_subject": [],
+                "weekly_accuracy": [],
             }
 
         import json as _json
@@ -2656,6 +2812,7 @@ async def get_user_stats(authorization: str = Header(None)):
                         "accuracy": round(100 * v[0] / v[1], 1) if v[1] else 0,
                     }
                     for k, v in agg.items()
+                    if v[1] > 0          # only topics/difficulties actually attempted
                 ],
                 key=lambda x: x["name"].lower(),
             )
@@ -2755,6 +2912,103 @@ async def get_user_stats(authorization: str = Header(None)):
             "per_topic_trend": per_topic_trend,
         }
 
+        # ---- Dashboard v2 — first-attempt accuracy, per-subject, weak-topic
+        # enrichment (attempts / avg time / repeated mistakes) and a weekly
+        # accuracy time-series for the trend chart. ----
+        seen_uids = set()
+        fa_correct = fa_total = 0          # first-attempt accuracy
+        subject_agg = {}                   # subject -> [correct, total]
+        topic_quizzes = {}                 # topic   -> set(attempt_id)
+        topic_time = {}                    # topic   -> [summed_seconds, question_count]
+        wrong_by_uid = {}                  # uid     -> times answered wrong
+        uid_topic = {}                     # uid     -> topic
+        week_agg = {}                      # 'YYYY-Www' -> [correct, total]
+
+        for r in rows:
+            attempt_id   = r[0]
+            attempt_sub  = r[2] or "Mixed"
+            attempt_time = int(r[6] or 0)
+            ts           = r[8]
+            try:
+                _qs = _json.loads(r[7]) if r[7] else []
+            except Exception:
+                _qs = []
+            valid_qs = [q for q in _qs if isinstance(q, dict)]
+            n_q = len(valid_qs) if valid_qs else int(r[5] or 0)
+            per_q_time = (attempt_time / n_q) if n_q else 0
+            try:
+                _iso = ts.isocalendar()
+                wk = f"{_iso[0]}-W{int(_iso[1]):02d}"
+            except Exception:
+                wk = None
+
+            if valid_qs:
+                for q in valid_qs:
+                    ic   = bool(q.get("is_correct"))
+                    sub  = q.get("subtopic") or attempt_sub or "Mixed"
+                    subj = q.get("subject") or "Physics"
+                    uid  = q.get("uid")
+                    subject_agg.setdefault(subj, [0, 0])
+                    subject_agg[subj][0] += int(ic); subject_agg[subj][1] += 1
+                    topic_quizzes.setdefault(sub, set()).add(attempt_id)
+                    tt = topic_time.setdefault(sub, [0.0, 0])
+                    tt[0] += per_q_time; tt[1] += 1
+                    if uid:
+                        uid_topic[uid] = sub
+                        if uid not in seen_uids:
+                            seen_uids.add(uid)
+                            fa_total += 1; fa_correct += int(ic)
+                        if not ic:
+                            wrong_by_uid[uid] = wrong_by_uid.get(uid, 0) + 1
+                    if wk:
+                        wa = week_agg.setdefault(wk, [0, 0])
+                        wa[0] += int(ic); wa[1] += 1
+            else:
+                c, t = int(r[3] or 0), int(r[5] or 0)
+                subject_agg.setdefault("Physics", [0, 0])
+                subject_agg["Physics"][0] += c; subject_agg["Physics"][1] += t
+                topic_quizzes.setdefault(attempt_sub, set()).add(attempt_id)
+                tt = topic_time.setdefault(attempt_sub, [0.0, 0])
+                tt[0] += attempt_time; tt[1] += t
+                if wk:
+                    wa = week_agg.setdefault(wk, [0, 0])
+                    wa[0] += c; wa[1] += t
+
+        first_attempt_accuracy = round(100 * fa_correct / fa_total, 1) if fa_total else 0
+
+        by_subject = sorted(
+            [{"name": k, "correct": v[0], "total": v[1],
+              "accuracy": round(100 * v[0] / v[1], 1) if v[1] else 0}
+             for k, v in subject_agg.items() if v[1] > 0],
+            key=lambda x: x["name"].lower(),
+        )
+
+        repeated_by_topic = {}
+        for _uid, _wc in wrong_by_uid.items():
+            if _wc >= 2:
+                _t = uid_topic.get(_uid, "Mixed")
+                repeated_by_topic[_t] = repeated_by_topic.get(_t, 0) + 1
+
+        _trend_delta = {t["name"]: t["delta"] for t in per_topic_trend}
+
+        def _enrich_topic(entry):
+            nm = entry["name"]
+            tt = topic_time.get(nm, [0.0, 0])
+            entry["quizzes"]           = len(topic_quizzes.get(nm, set()))
+            entry["avg_time"]          = round(tt[0] / tt[1], 1) if tt[1] else 0
+            entry["repeated_mistakes"] = repeated_by_topic.get(nm, 0)
+            entry["trend_delta"]       = _trend_delta.get(nm)
+            return entry
+
+        for _e in by_subtopic:   # weakest entries share these dict refs
+            _enrich_topic(_e)
+
+        weekly_accuracy = [
+            {"week": _wk, "correct": _v[0], "total": _v[1],
+             "accuracy": round(100 * _v[0] / _v[1], 1) if _v[1] else 0}
+            for _wk, _v in sorted(week_agg.items())
+        ][-8:]
+
         return {
             "total_attempts": total_attempts,
             "total_quizzes": unique_quizzes,
@@ -2769,6 +3023,9 @@ async def get_user_stats(authorization: str = Header(None)):
             "weakest_subtopics": weakest,
             "recent_streak_days": streak,
             "growth": growth,
+            "first_attempt_accuracy": first_attempt_accuracy,
+            "by_subject": by_subject,
+            "weekly_accuracy": weekly_accuracy,
         }
     except HTTPException:
         raise
@@ -3009,15 +3266,16 @@ async def get_user_ranks(authorization: str = Header(None)):
                 _xp   = int(_xr[0]) if _xr and _xr[0] is not None else 0
                 _gems = int(_xr[1]) if _xr and _xr[1] is not None else 0
                 _goal = int(_xr[2]) if _xr and _xr[2] is not None else 10
-                # Freeze count: 0 if no streak row yet.
+                # Freeze count: 1 if no streak row yet (everyone starts with
+                # the free weekly freeze, matching /api/streak's default).
                 cursor2.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
                 _fr = cursor2.fetchone()
-                _freezes = int(_fr[0]) if _fr and _fr[0] is not None else 0
+                _freezes = int(_fr[0]) if _fr and _fr[0] is not None else 1
             finally:
                 cursor2.close()
                 conn2.close()
         except Exception:
-            _xp, _gems, _goal, _freezes = 0, 0, 10, 0
+            _xp, _gems, _goal, _freezes = 0, 0, 10, 1
 
         return {
             "ranks":             ranks,
@@ -3180,11 +3438,12 @@ def _award_streak_day(cursor, conn, user_id, today):
     else:
         current_streak, longest_streak, last_qualified, freezes, freeze_granted, freeze_used_date = srow
 
-    # Hybrid freeze policy: every ISO week the user gets +1 free freeze
-    # (capped at GEMS_FREEZE_CAP). They can also buy +1 via /api/freeze/purchase,
-    # subject to the same cap. Unused freezes carry across weeks until cap.
+    # Weekly freeze policy: at the start of a new ISO week, top the user up to
+    # a FLOOR of 1 free freeze. No stacking — a user who still holds a freeze
+    # from last week gets nothing extra. They can still buy +1 via
+    # /api/freeze/purchase, up to GEMS_FREEZE_CAP.
     if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
-        freezes = min(GEMS_FREEZE_CAP, (freezes or 0) + 1)
+        freezes = max(freezes or 0, 1)
         freeze_granted = today
 
     freeze_used = False
@@ -3290,9 +3549,10 @@ def _lazy_streak_maintenance(cursor, conn, user_id, today):
 
     dirty = False
 
-    # Hybrid freeze policy: weekly +1 grant on read, capped at GEMS_FREEZE_CAP.
+    # Weekly freeze policy: new ISO week tops the user up to a floor of 1 free
+    # freeze on read. No stacking — already holding one means no extra grant.
     if freeze_granted is None or today.isocalendar()[:2] != freeze_granted.isocalendar()[:2]:
-        freezes = min(GEMS_FREEZE_CAP, (freezes or 0) + 1)
+        freezes = max(freezes or 0, 1)
         freeze_granted = today
         dirty = True
 
@@ -3378,6 +3638,25 @@ def _sg_today():
     """Today's date in Singapore time (the app's audience is SG)."""
     from datetime import datetime, timezone, timedelta
     return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def _effective_today(user_id):
+    """SG today plus the user's dev-tools day offset (streak test panel).
+    In production test_day_offset is always 0, so this equals _sg_today().
+    Self-contained — opens its own connection so any endpoint can call it."""
+    from datetime import timedelta
+    off = 0
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT test_day_offset FROM users WHERE id = %s", (user_id,))
+        r = cur.fetchone()
+        off = int(r[0]) if r and r[0] else 0
+        cur.close()
+        conn.close()
+    except Exception:
+        off = 0
+    return _sg_today() + timedelta(days=off)
 
 
 def get_user_topic_accuracy(user_id: int) -> dict:
@@ -3481,7 +3760,7 @@ async def get_daily_challenge(subject: str = "Physics", authorization: str = Hea
                     question.image_url = question.setup_image_url
 
         # Has the user already cleared today's challenge for this subject?
-        today = _sg_today()
+        today = _effective_today(user_id)
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -3573,7 +3852,7 @@ async def submit_daily_challenge(request: DailyChallengeSubmitRequest, authoriza
             raise HTTPException(status_code=400, detail="total must be greater than 0")
         score = max(0, min(request.score, request.total))
         percentage = round(100 * score / request.total)
-        today = _sg_today()
+        today = _effective_today(user_id)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -3751,7 +4030,7 @@ async def get_streak(authorization: str = Header(None)):
         if not payload:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         user_id = payload.get("user_id")
-        today = _sg_today()
+        today = _effective_today(user_id)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -3771,7 +4050,7 @@ async def get_streak(authorization: str = Header(None)):
                 return {
                     "current_streak": 0, "longest_streak": 0, "freezes_available": 1,
                     "did_today": False, "last_qualified_date": None,
-                    "freeze_used_date": None,
+                    "freeze_used_date": None, "effective_today": str(today),
                 }
             current, longest, last_q, freezes, freeze_granted, freeze_used_date = row
             did_today = (last_q == today)
@@ -3783,6 +4062,7 @@ async def get_streak(authorization: str = Header(None)):
                 "did_today": did_today,
                 "last_qualified_date": str(last_q) if last_q else None,
                 "freeze_used_date": str(freeze_used_date) if freeze_used_date else None,
+                "effective_today": str(today),
             }
         finally:
             cursor.close()
@@ -3808,7 +4088,7 @@ async def get_streak_week(authorization: str = Header(None)):
         user_id = payload.get("user_id")
 
         from datetime import timedelta
-        today = _sg_today()
+        today = _effective_today(user_id)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -3894,9 +4174,9 @@ async def get_leaderboard(
     limit: int  = 50,
 ):
     """Global leaderboard. `period` is one of:
-      - 'daily'   -> SUM of daily_challenges.score for today (SG)
-      - 'weekly'  -> SUM of daily_challenges.score over current ISO week (Mon-Sun)
-      - 'alltime' -> users.xp
+      - 'daily'   -> XP earned today (SG)
+      - 'weekly'  -> XP earned over the current ISO week (Mon-Sun)
+      - 'alltime' -> users.xp (lifetime total)
 
     Returns the top `limit` users plus the current user appended at the end
     (with their actual rank index) when they fall outside the top slice.
@@ -3914,7 +4194,7 @@ async def get_leaderboard(
             raise HTTPException(status_code=400, detail="period must be daily|weekly|alltime")
 
         from datetime import timedelta
-        today  = _sg_today()
+        today  = _effective_today(me_id)
         monday = today - timedelta(days=today.weekday())
         sunday = monday + timedelta(days=6)
 
@@ -3931,7 +4211,7 @@ async def get_leaderboard(
             elif period == "daily":
                 cursor.execute("""
                     SELECT u.id, u.name, u.avatar_url,
-                           COALESCE(SUM(dc.score), 0) AS score
+                           COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id AND dc.challenge_date = %s
@@ -3942,7 +4222,7 @@ async def get_leaderboard(
             else:  # weekly
                 cursor.execute("""
                     SELECT u.id, u.name, u.avatar_url,
-                           COALESCE(SUM(dc.score), 0) AS score
+                           COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id
@@ -4001,108 +4281,6 @@ async def get_leaderboard(
         raise
     except Exception as e:
         print(f"❌ Error in /api/leaderboard: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-class DailyGoalUpdateRequest(BaseModel):
-    goal: int  # must be 10 / 15 / 20
-
-
-@app.patch("/api/profile/daily-goal")
-async def set_daily_goal(request: DailyGoalUpdateRequest, authorization: str = Header(None)):
-    """Set the user's daily goal (10 / 15 / 20). StarQuest §06."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-        goal = int(request.goal)
-        if goal not in (10, 15, 20):
-            raise HTTPException(status_code=400, detail="daily_goal must be 10, 15, or 20")
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("UPDATE users SET daily_goal = %s WHERE id = %s", (goal, user_id))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-        return {"success": True, "daily_goal": goal}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error in /api/profile/daily-goal: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/freeze/purchase")
-async def purchase_freeze(authorization: str = Header(None)):
-    """Spend GEMS_FREEZE_COST gems to add 1 streak freeze. Cap at GEMS_FREEZE_CAP."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
-            row = cursor.fetchone()
-            gems_have = int(row[0]) if row and row[0] is not None else 0
-            if gems_have < GEMS_FREEZE_COST:
-                raise HTTPException(status_code=400,
-                    detail=f"Need {GEMS_FREEZE_COST} gems, have {gems_have}")
-
-            cursor.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
-            srow = cursor.fetchone()
-            freezes_have = int(srow[0]) if srow and srow[0] is not None else 0
-            if freezes_have >= GEMS_FREEZE_CAP:
-                raise HTTPException(status_code=400,
-                    detail=f"Freeze cap reached ({GEMS_FREEZE_CAP}). Use one before buying another.")
-
-            # Spend gems + grant freeze.
-            cursor.execute("UPDATE users SET gems = gems - %s WHERE id = %s",
-                           (GEMS_FREEZE_COST, user_id))
-            if not srow:
-                # No streaks row yet — bootstrap one with this freeze counting as freeze #1.
-                cursor.execute(
-                    "INSERT INTO streaks (user_id, current_streak, longest_streak, "
-                    "freezes_available, freeze_last_granted) VALUES (%s, 0, 0, 1, %s)",
-                    (user_id, _sg_today()),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE streaks SET freezes_available = freezes_available + 1 WHERE user_id = %s",
-                    (user_id,),
-                )
-            conn.commit()
-
-            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
-            gems_after = int(cursor.fetchone()[0])
-            cursor.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
-            freezes_after = int(cursor.fetchone()[0])
-        finally:
-            cursor.close()
-            conn.close()
-
-        return {
-            "success":           True,
-            "gems_spent":        GEMS_FREEZE_COST,
-            "gems_total":        gems_after,
-            "freezes_available": freezes_after,
-            "freeze_cap":        GEMS_FREEZE_CAP,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error in /api/freeze/purchase: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -4237,296 +4415,6 @@ async def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================================
-# TEMPORARY — STREAK TEST ENDPOINTS (delete before production hardening)
-# ============================================================================
-
-class TestXpGrantRequest(BaseModel):
-    amount: int  # may be negative to take XP away (won't go below 0)
-
-
-@app.post("/api/test/xp-grant")
-async def test_xp_grant(request: TestXpGrantRequest, authorization: str = Header(None)):
-    """TEMPORARY — grant or revoke XP. Detects rank-up + level change so the
-    panel can fire a celebration. Returns the same shape as /api/quiz/submit
-    so the frontend can reuse the rewards renderer."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-        delta = int(request.amount)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
-            row = cursor.fetchone()
-            xp_pre = int(row[0]) if row and row[0] is not None else 0
-            xp_post = max(0, xp_pre + delta)
-
-            cursor.execute("UPDATE users SET xp = %s WHERE id = %s", (xp_post, user_id))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-
-        pre_rank  = compute_rank(xp_pre)
-        post_rank = compute_rank(xp_post)
-        return {
-            "success":     True,
-            "xp_delta":    xp_post - xp_pre,
-            "xp_pre":      xp_pre,
-            "xp_total":    xp_post,
-            "progression": compute_progression(xp_post),
-            "rank_up":     post_rank["tier_index"] > pre_rank["tier_index"],
-            "rank_down":   post_rank["tier_index"] < pre_rank["tier_index"],
-            "new_rank":    post_rank,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error in /api/test/xp-grant: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class TestGemsGrantRequest(BaseModel):
-    amount: int
-
-
-@app.post("/api/test/gems-grant")
-async def test_gems_grant(request: TestGemsGrantRequest, authorization: str = Header(None)):
-    """TEMPORARY — grant or revoke gems (clamped at 0)."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-        delta = int(request.amount)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT gems FROM users WHERE id = %s", (user_id,))
-            row = cursor.fetchone()
-            pre = int(row[0]) if row and row[0] is not None else 0
-            post = max(0, pre + delta)
-            cursor.execute("UPDATE users SET gems = %s WHERE id = %s", (post, user_id))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-        return {"success": True, "gems_delta": post - pre, "gems_total": post}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error in /api/test/gems-grant: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/test/progression-reset")
-async def test_progression_reset(authorization: str = Header(None)):
-    """TEMPORARY — set xp=0 and gems=0 for the current user. Streaks/rewards
-    are NOT touched — use /api/test/streak-reset for those."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("UPDATE users SET xp = 0, gems = 0 WHERE id = %s", (user_id,))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-        return {"success": True, "xp_total": 0, "gems_total": 0,
-                "progression": compute_progression(0)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error in /api/test/progression-reset: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class TestStreakCreditRequest(BaseModel):
-    # 'next'    = day AFTER last_qualified (or today if no streak yet) — clean advance
-    # 'freeze'  = last_qualified + 2 days (skips 1) — exercises freeze logic
-    # 'absolute'= use days_offset relative to today (legacy)
-    mode: str = "next"
-    days_offset: int = 0
-    correct: int = 10
-    subject: str = "Physics"
-
-
-@app.post("/api/test/streak-credit")
-async def test_streak_credit(request: TestStreakCreditRequest, authorization: str = Header(None)):
-    """TEMPORARY — credit `correct` answers to the daily tally for a simulated day
-    (today + days_offset). If the target is crossed, the streak fires through the
-    same `_award_streak_day(...)` path as a real practice quiz. Returns the full
-    streak state so the panel can show what happened."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-
-        from datetime import timedelta
-        correct = max(0, int(request.correct))
-        # "total attempted" — assume each correct came from a 1:1 attempt (kept simple).
-        total = max(correct, 1)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            today_correct = 0
-            today_total   = 0
-            now_p         = False
-            streak_awarded = False
-            freeze_used    = False
-
-            if request.mode == "freeze":
-                # Simulate a MISSED day with auto-freeze: NO daily_challenges row
-                # is created (the bridged day is unqualified). We mutate streaks
-                # directly the same way _lazy_streak_maintenance would on a read
-                # after a real-life missed day.
-                cursor.execute(
-                    "SELECT current_streak, longest_streak, last_qualified_date, "
-                    "freezes_available, freeze_last_granted "
-                    "FROM streaks WHERE user_id = %s",
-                    (user_id,),
-                )
-                _row = cursor.fetchone()
-                if not _row or _row[2] is None:
-                    # No streak yet — nothing to protect. Bail with the current state.
-                    simulated_day = _sg_today()
-                else:
-                    cur_s, long_s, last_q, freezes, freeze_granted = _row
-                    bridged = last_q + timedelta(days=1)   # the "missed" day
-                    simulated_day = bridged
-
-                    # Weekly regen check (matches _award_streak_day / _lazy).
-                    if (freeze_granted is None
-                            or bridged.isocalendar()[:2] != freeze_granted.isocalendar()[:2]):
-                        freezes = 1
-                        freeze_granted = bridged
-
-                    if freezes < 1:
-                        # No freeze available — streak breaks instead.
-                        cursor.execute(
-                            "UPDATE streaks SET current_streak = 0, "
-                            "freeze_last_granted = %s WHERE user_id = %s",
-                            (freeze_granted, user_id),
-                        )
-                        conn.commit()
-                        streak_awarded = False
-                        freeze_used    = False
-                    else:
-                        freezes -= 1
-                        cursor.execute(
-                            "UPDATE streaks SET last_qualified_date = %s, "
-                            "freezes_available = %s, freeze_last_granted = %s, "
-                            "freeze_used_date = %s WHERE user_id = %s",
-                            (bridged, freezes, freeze_granted, bridged, user_id),
-                        )
-                        conn.commit()
-                        # Treat freeze fire as a streak event so the celebration mounts.
-                        streak_awarded = True
-                        freeze_used    = True
-            else:
-                # 'next' / 'absolute' — simulate a real qualifying day.
-                if request.mode == "absolute":
-                    simulated_day = _sg_today() + timedelta(days=int(request.days_offset))
-                else:
-                    cursor.execute(
-                        "SELECT last_qualified_date FROM streaks WHERE user_id = %s",
-                        (user_id,),
-                    )
-                    _row = cursor.fetchone()
-                    last_q = _row[0] if _row and _row[0] else None
-                    simulated_day = (last_q + timedelta(days=1)) if last_q else _sg_today()
-
-                prev_p, now_p, today_correct, today_total = _credit_daily_practice(
-                    cursor, conn, user_id, request.subject, simulated_day, correct, total
-                )
-                if now_p and not prev_p:
-                    _cs, _ls, _fz, _fu = _award_streak_day(cursor, conn, user_id, simulated_day)
-                    streak_awarded = True
-                    freeze_used    = _fu
-
-            cursor.execute(
-                "SELECT current_streak, longest_streak, last_qualified_date, "
-                "freezes_available, freeze_last_granted FROM streaks WHERE user_id = %s",
-                (user_id,),
-            )
-            srow = cursor.fetchone()
-        finally:
-            cursor.close()
-            conn.close()
-
-        return {
-            "simulated_day":      str(simulated_day),
-            "credited_correct":   correct,
-            "today_correct":      today_correct,
-            "today_total":        today_total,
-            "target":             DAILY_CORRECT_TARGET,
-            "passed_today":       now_p,
-            "streak_awarded":     streak_awarded,
-            "freeze_used":        freeze_used,
-            "current_streak":     srow[0] if srow else 0,
-            "longest_streak":     srow[1] if srow else 0,
-            "last_qualified_date": str(srow[2]) if srow and srow[2] else None,
-            "freezes_available":  srow[3] if srow else 0,
-            "freeze_last_granted": str(srow[4]) if srow and srow[4] else None,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"\u274c Error in /api/test/streak-credit: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/test/streak-reset")
-async def test_streak_reset(authorization: str = Header(None)):
-    """TEMPORARY — wipe this user's daily_challenges + streaks rows so the test
-    panel can start over with a clean slate. Does NOT touch quiz_attempts or rank."""
-    try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="No authorization token")
-        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-        user_id = payload.get("user_id")
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("DELETE FROM daily_challenges WHERE user_id = %s", (user_id,))
-            n_daily = cursor.rowcount
-            cursor.execute("DELETE FROM streaks WHERE user_id = %s", (user_id,))
-            n_streak = cursor.rowcount
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-        return {"ok": True, "deleted_daily_rows": n_daily, "deleted_streak_rows": n_streak}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"\u274c Error in /api/test/streak-reset: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.on_event("startup")
 async def startup_event():
     """Load questions and pre-cache files on startup"""
@@ -4554,7 +4442,7 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    print("🎯 Starting Quiz Maker Backend...")
+    print("🎯 Starting HabitGo Backend...")
     print(f"📄 Spreadsheet ID: {SPREADSHEET_ID}")
     print(f"📁 Drive Folder ID: {QUESTION_FOLDER_ID}")
     print("\n💡 API will be available at http://localhost:8000")
