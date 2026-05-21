@@ -2804,12 +2804,16 @@ async def get_user_stats(authorization: str = Header(None)):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            # Stats cover both Practice and Daily Challenge attempts. Daily
+            # quizzes (QuizMaker mode="daily") are stored in quiz_attempts with
+            # quiz_type='daily' and carry the same per-question questions_data,
+            # so every breakdown works for them just like practice attempts.
             cursor.execute(
                 """
                 SELECT id, difficulty, subtopic, score, percentage, total_questions,
                        time_spent_seconds, questions_data, attempted_at, parent_attempt_id
                 FROM quiz_attempts
-                WHERE user_id = %s AND quiz_type = 'practice'
+                WHERE user_id = %s AND quiz_type IN ('practice', 'daily')
                 ORDER BY attempted_at ASC
                 """,
                 (user_id,),
@@ -2930,7 +2934,7 @@ async def get_user_stats(authorization: str = Header(None)):
             streak += 1
             d -= timedelta(days=1)
 
-        # ---- T3.2: Practice growth metrics (improvement-led, practice-only) ----
+        # ---- T3.2: Growth metrics (improvement-led, Practice + Daily) ----
         now_dt = datetime.now()
         topic_series = {}   # topic -> [is_correct, ...] in chronological order
         wk_recent = [0, 0]  # [correct, total] for attempts < 7 days old
