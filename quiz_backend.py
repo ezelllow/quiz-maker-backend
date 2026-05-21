@@ -2050,7 +2050,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 # Use frontend-provided questions with calculated correctness
                 full_questions_data = []
                 for idx, q in enumerate(request.questions):
-                    user_answer = request.user_answers.get(str(idx), "")
+                    user_answer = request.user_answers.get(idx, "")
                     correct_answer = q.get('answer', "").strip()
                     is_correct = answer_key(user_answer) == answer_key(correct_answer)
                     q_copy = q.copy()
@@ -2068,7 +2068,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
                 )
                 full_questions_data = []
                 for idx, q in enumerate(filtered_questions[:request.count]):  # Only store the count requested
-                    user_answer = request.user_answers.get(str(idx), "")
+                    user_answer = request.user_answers.get(idx, "")
                     correct_answer = q.answer.strip()
                     is_correct = answer_key(user_answer) == answer_key(correct_answer)
                     full_questions_data.append({
@@ -4448,8 +4448,4 @@ async def startup_event():
 if __name__ == "__main__":
     import uvicorn
     print("🎯 Starting HabitGo Backend...")
-    print(f"📄 Spreadsheet ID: {SPREADSHEET_ID}")
-    print(f"📁 Drive Folder ID: {QUESTION_FOLDER_ID}")
-    print("\n💡 API will be available at http://localhost:8000")
-    print("📖 Docs at http://localhost:8000/docs\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    pr
