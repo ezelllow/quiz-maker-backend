@@ -292,7 +292,12 @@ def parse_option_type(options_str: str) -> Tuple[str, str, Optional[List], Optio
 
         for i, line in enumerate(lines):
             line = line.strip()
-            if not line or line.startswith('TABLE:'):
+            # Strip a leading "TABLE:" marker. The first header row may be
+            # written on the SAME line as TABLE: (e.g. "TABLE: H1 | H2") —
+            # keep that text instead of discarding the whole line.
+            if line.startswith('TABLE:'):
+                line = line[6:].strip()
+            if not line:
                 continue
 
             # Check if this is a data row (starts with A, B, C, or D followed by ))
