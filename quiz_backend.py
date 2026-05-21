@@ -10,12 +10,13 @@ from typing import List, Optional, Tuple, Dict
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from io import BytesIO
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import json
+import queue
 from functools import lru_cache
 import pymysql
 import jwt
@@ -375,14 +376,89 @@ def parse_option_type(options_str: str) -> Tuple[str, str, Optional[List], Optio
 # DATABASE HELPER FUNCTIONS
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# Connection pool — opening a fresh MySQL connection per request is expensive
+# (TCP + auth handshake, tens to hundreds of ms each, especially to a remote
+# DB). We keep a small pool of live connections and reuse them. Returning a
+# connection is done by calling .close() on it, exactly like before — the
+# _PooledConn wrapper intercepts that and hands the real connection back to
+# the pool instead of tearing it down. No call site needs to change.
+# ---------------------------------------------------------------------------
+_DB_POOL = queue.Queue(maxsize=8)
+
+
+class _PooledConn:
+    """Thin proxy around a pymysql connection. .close() returns it to the
+    pool; every other attribute/method delegates to the real connection."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._returned = False
+
+    def __getattr__(self, name):
+        # Only reached for attributes not defined on the proxy itself.
+        return getattr(self._raw, name)
+
+    def cursor(self, *args, **kwargs):
+        return self._raw.cursor(*args, **kwargs)
+
+    def commit(self):
+        return self._raw.commit()
+
+    def rollback(self):
+        return self._raw.rollback()
+
+    def close(self):
+        # Return the underlying connection to the pool rather than closing it.
+        if self._returned:
+            return
+        self._returned = True
+        try:
+            self._raw.rollback()        # clear any half-finished transaction
+            _DB_POOL.put_nowait(self._raw)
+        except Exception:
+            # Pool full, or the connection is dead — just drop it for real.
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 def get_db_connection():
-    """Get MySQL database connection"""
+    """Get a MySQL connection from the pool (or open a new one if the pool is
+    empty). Call .close() on the returned object to release it back."""
+    raw = None
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        return conn
-    except Exception as e:
-        print(f"❌ Database connection error: {e}")
-        raise HTTPException(status_code=500, detail="Database connection failed")
+        raw = _DB_POOL.get_nowait()
+    except queue.Empty:
+        raw = None
+
+    if raw is not None:
+        # Make sure the pooled connection is still alive; reconnect if not.
+        try:
+            raw.ping(reconnect=True)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raw = None
+
+    if raw is None:
+        try:
+            raw = pymysql.connect(**DB_CONFIG)
+        except Exception as e:
+            print(f"❌ Database connection error: {e}")
+            raise HTTPException(status_code=500, detail="Database connection failed")
+
+    return _PooledConn(raw)
 
 def init_database():
     """Initialize database tables if they don't exist"""
@@ -1577,50 +1653,61 @@ async def export_questions_by_category():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Question diagrams on Google Drive never change, so once we've fetched the
+# bytes we keep them in memory and never round-trip to Drive again. The
+# response also tells the browser to cache them forever (immutable), so a
+# returning user re-loads images straight from disk cache.
+_IMAGE_CACHE = {}
+_IMAGE_CACHE_MAX = 300
+_IMAGE_HEADERS = {
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "Content-Disposition": "inline; filename=image.png",
+}
+
+
 @app.get("/api/image/{file_id}")
 async def serve_image(file_id: str):
     """
     Backend image proxy endpoint.
-    Downloads image from Google Drive and serves it directly.
+    Serves Google Drive images, cached in memory after the first fetch.
     Bypasses Google Drive embedding restrictions.
     """
     try:
+        # Fast path — already in the in-memory cache.
+        cached = _IMAGE_CACHE.get(file_id)
+        if cached is not None:
+            return Response(content=cached, media_type="image/png", headers=_IMAGE_HEADERS)
+
         if not drive_service:
             raise HTTPException(status_code=500, detail="Google Drive service not initialized")
 
-        print(f"🖼️  Serving image: {file_id}")
-
         # Download file from Google Drive
         request = drive_service.files().get_media(fileId=file_id)
-        file_stream = BytesIO()
-
         downloader = request.execute()
         if isinstance(downloader, bytes):
-            file_stream.write(downloader)
+            data = downloader
         else:
             # If it's a stream, read it
+            buf = BytesIO()
             while True:
                 chunk = downloader.read(8192)
                 if not chunk:
                     break
-                file_stream.write(chunk)
+                buf.write(chunk)
+            data = buf.getvalue()
 
-        file_stream.seek(0)
+        # Store in the cache (simple FIFO eviction once the cap is reached).
+        if len(_IMAGE_CACHE) >= _IMAGE_CACHE_MAX:
+            try:
+                _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+            except StopIteration:
+                pass
+        _IMAGE_CACHE[file_id] = data
 
-        # Determine MIME type based on file ID or default to image
-        mime_type = "image/png"
+        return Response(content=data, media_type="image/png", headers=_IMAGE_HEADERS)
 
-        print(f"✅ Served {file_id} ({len(file_stream.getvalue())} bytes)")
-
-        return StreamingResponse(
-            iter([file_stream.getvalue()]),
-            media_type=mime_type,
-            headers={
-                "Cache-Control": "public, max-age=3600",
-                "Content-Disposition": f"inline; filename=image.png"
-            }
-        )
-
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Error serving image {file_id}: {e}")
         raise HTTPException(status_code=404, detail=f"Could not load image: {str(e)}")
@@ -3646,22 +3733,14 @@ def _sg_today():
 
 
 def _effective_today(user_id):
-    """SG today plus the user's dev-tools day offset (streak test panel).
-    In production test_day_offset is always 0, so this equals _sg_today().
-    Self-contained — opens its own connection so any endpoint can call it."""
-    from datetime import timedelta
-    off = 0
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT test_day_offset FROM users WHERE id = %s", (user_id,))
-        r = cur.fetchone()
-        off = int(r[0]) if r and r[0] else 0
-        cur.close()
-        conn.close()
-    except Exception:
-        off = 0
-    return _sg_today() + timedelta(days=off)
+    """SG 'today' for the given user.
+
+    This used to add a per-user dev-tools day offset (the streak test panel),
+    but the test tools were removed and test_day_offset is permanently 0. It
+    is now a pure function — no DB round-trip — which matters because it was
+    being called on nearly every endpoint and each call opened a connection.
+    The user_id argument is kept so existing call sites need no change."""
+    return _sg_today()
 
 
 def get_user_topic_accuracy(user_id: int) -> dict:
@@ -4424,22 +4503,23 @@ async def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(
 async def startup_event():
     """Load questions and pre-cache files on startup"""
     try:
-        print("🚀 Starting up...")
-        print("💾 Initializing database...")
+        print("\U0001f680 Starting up...")
+        print("\U0001f4be Initializing database...")
         init_database()
-        print("📁 Pre-loading file map...")
+        print("\U0001f4c1 Pre-loading file map...")
         cache.load_file_map()
-        print("📋 Loading questions...")
+        print("\U0001f4cb Loading questions...")
         cache.load_questions()
-        print(f"📊 Available subtopics: {cache.get_unique_subtopics()}")
-        print(f"📊 Available difficulties: {cache.get_unique_difficulties()}")
+        print(f"\U0001f4ca Available subtopics: {cache.get_unique_subtopics()}")
+        print(f"\U0001f4ca Available difficulties: {cache.get_unique_difficulties()}")
         stats = get_category_statistics()
-        print("\n📊 Question Categories:")
+        print("\n\U0001f4ca Question Categories:")
         for qtype, data in stats.items():
             print(f"  {qtype}: {data['count']} questions ({data['percentage']}%)")
         print("\n✅ Startup complete!")
     except Exception as e:
         print(f"❌ Failed during startup: {e}")
+
 
 # ============================================================================
 # RUN SERVER
@@ -4447,5 +4527,6 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    print("🎯 Starting HabitGo Backend...")
-    pr
+    print("\U0001f3af Starting HabitGo Backend...")
+    print("\U0001f4da API docs: http://localhost:8000/docs")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
