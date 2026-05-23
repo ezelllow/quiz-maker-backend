@@ -1350,6 +1350,45 @@ async def get_subtopics(level: str = None):
         print(f"  ❌ Error in /api/subtopics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/availability")
+async def get_availability(level: str = None):
+    """Per-topic difficulty availability for the build form. Returns
+    {topic: {"easy": N, "medium": N, "hard": N}} -- the question count per
+    topic per difficulty at the chosen level. Lets the frontend grey out a
+    difficulty when the picked topics can't supply enough questions."""
+    try:
+        if not cache.is_loaded:
+            cache.load_questions()
+
+        cat = (level or '').strip().lower()
+        level_known = cat in ('pure', 'nonpure', 'non-pure', 'combined')
+        want_nonpure = (cat != 'pure') if level_known else None
+
+        avail = {}
+        for q in cache.questions:
+            if not q.subtopic or q.subtopic.lower() == 'question setup':
+                continue
+            if want_nonpure is not None and _is_nonpure(q.level) != want_nonpure:
+                continue
+            dk = str(q.difficulty or '').strip().lower()
+            if dk.startswith('eas'):
+                dk = 'easy'
+            elif dk.startswith('med'):
+                dk = 'medium'
+            elif dk.startswith('har'):
+                dk = 'hard'
+            else:
+                continue
+            counts = avail.setdefault(q.subtopic, {'easy': 0, 'medium': 0, 'hard': 0})
+            counts[dk] += 1
+
+        result = avail
+        print(f"  /api/availability (level={cat or 'all'}) -> {len(result)} topics")
+        return result
+    except Exception as e:
+        print(f"  Error in /api/availability: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/difficulties", response_model=List[str])
 async def get_difficulties():
     """Get all available difficulty levels"""
