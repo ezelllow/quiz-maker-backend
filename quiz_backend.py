@@ -1270,7 +1270,7 @@ PURE_TOPIC_ORDER = [
 ]
 
 COMBINED_TOPIC_ORDER = [
-    "Physical Quantities, Units and Measurement",
+    "Physical Quantities, Units and Measurements",
     "Kinematics",
     "Force and Pressure",
     "Dynamics",
@@ -1331,16 +1331,15 @@ async def get_subtopics(level: str = None):
         if cat in ('pure', 'nonpure', 'non-pure', 'combined'):
             want_nonpure = cat != 'pure'
             order = COMBINED_TOPIC_ORDER if want_nonpure else PURE_TOPIC_ORDER
-            order_norms = {_norm_topic(c) for c in order}
-            # Only surface topics that belong to the chosen syllabus — any
-            # other topic value in the sheet is dropped from the filter.
-            seen = set()
+            # Surface the full syllabus list, in order. Where a topic has
+            # questions, use the exact name from the sheet so quiz generation
+            # matches; where it has none, fall back to the canonical name.
+            by_norm = {}
             for q in cache.questions:
                 if (q.subtopic and q.subtopic.lower() != 'question setup'
-                        and _is_nonpure(q.level) == want_nonpure
-                        and _norm_topic(q.subtopic) in order_norms):
-                    seen.add(q.subtopic)
-            subtopics = sorted(seen, key=lambda s: _topic_sort_key(s, order))
+                        and _is_nonpure(q.level) == want_nonpure):
+                    by_norm.setdefault(_norm_topic(q.subtopic), q.subtopic)
+            subtopics = [by_norm.get(_norm_topic(c), c) for c in order]
         else:
             subtopics = sorted(cache.get_unique_subtopics(),
                                key=lambda s: _topic_sort_key(s, PURE_TOPIC_ORDER))
