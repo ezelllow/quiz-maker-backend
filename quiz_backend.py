@@ -129,6 +129,7 @@ class Question(BaseModel):
     question_text: str
     options: str
     answer: str
+    explanation: Optional[str] = None  # 'Explanation' column from the sheet -- shown after the user submits an answer
     image_url: Optional[str] = None
     setup_image_url: Optional[str] = None  # Setup diagram URL (for frontend to display)
     diagram_file_id: Optional[str] = None  # File ID from Diagram column (setup)
@@ -897,6 +898,9 @@ class QuestionCache:
 
             # Use 'Topic' if available, fallback to 'Subtopic' for backward compatibility
             topic_col = 'Topic' if 'Topic' in col_map else 'Subtopic'
+            # 'Explanation' column (optional, case-insensitive): why an answer is right/wrong
+            expl_col_idx = next((idx for hdr, idx in col_map.items()
+                                 if str(hdr).strip().lower() == 'explanation'), None)
             required_cols = ['UID', 'QNo', 'Difficulty', 'Question', 'Options', 'Answer']
 
             # Verify all required columns exist
@@ -923,6 +927,9 @@ class QuestionCache:
                     question_text = row[col_map['Question']].strip()
                     options = row[col_map['Options']].strip()
                     answer = row[col_map['Answer']].strip()
+                    explanation = (row[expl_col_idx].strip()
+                                   if expl_col_idx is not None and expl_col_idx < len(row)
+                                   else None) or None
 
                     # Get diagram file ID if Diagram column exists
                     diagram_file_id = None
@@ -982,7 +989,8 @@ class QuestionCache:
                         table_header_colspan=header_colspan,
                         table_rows=table_rows,
                         diagram_file_id=diagram_file_id,
-                        options_image_uid=options_image_uid
+                        options_image_uid=options_image_uid,
+                        explanation=explanation
                     )
                     self.questions.append(question)
 
@@ -2651,6 +2659,7 @@ async def get_attempt_details(attempt_id: int, authorization: str = Header(None)
                         'options_image_uid': full.options_image_uid,
                         'image_url': full.image_url,
                         'setup_image_url': full.setup_image_url,
+                        'explanation': full.explanation,
                         'index': q.get('index', i),
                         'user_answer': q.get('user_answer'),
                         'correct_answer': q.get('correct_answer') or full.answer,
@@ -2779,6 +2788,7 @@ async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)
                         'options_image_uid': full.options_image_uid,
                         'image_url': full.image_url,
                         'setup_image_url': full.setup_image_url,
+                        'explanation': full.explanation,
                         # preserve attempt-specific fields from the saved row
                         'user_answer': q.get('user_answer'),
                         'correct_answer': q.get('correct_answer') or full.answer,
