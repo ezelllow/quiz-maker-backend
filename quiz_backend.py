@@ -329,21 +329,33 @@ def parse_option_type(options_str: str) -> Tuple[str, str, Optional[List], Optio
                     # Remove letter and ")" and any spaces: "A) value" -> "value"
                     value = first_part[1:].lstrip(') ').strip() if len(first_part) > 1 else ''
 
+                    # Two data-row layouts occur in the sheet:
+                    #   "A) v1 | v2"   -> the letter is glued to the first value
+                    #   "A) | v1 | v2" -> the letter sits in its own pipe cell,
+                    #                     so the value glued to the letter is ''
+                    # Build one positional cell list that works for both, so the
+                    # values line up 1:1 with the (letter-less) flat headers.
+                    if value:
+                        cells = [value] + parts[1:]
+                    else:
+                        cells = parts[1:]
+                    # A closing pipe ("...| v2 |") leaves one trailing blank cell.
+                    if line.endswith('|') and cells and cells[-1] == '':
+                        cells.pop()
+
                     # Get flat headers for mapping (use last header row for simple cases)
                     flat_headers = header_rows[-1] if header_rows else []
 
-                    # Map values to headers
+                    # Map cell values to headers positionally
                     for j, header in enumerate(flat_headers):
-                        if j == 0:
-                            row_data[header] = value
-                        elif j < len(parts):
-                            row_data[header] = parts[j]
+                        if j < len(cells):
+                            row_data[header] = cells[j]
 
                     row_data['_letter'] = letter
                     # Positional cell values (letter prefix stripped) so the
                     # frontend can render the row even when the table has no
                     # header row to key the values by.
-                    row_data['_cells'] = [value] + parts[1:]
+                    row_data['_cells'] = cells
                     table_rows.append(row_data)
 
         # Determine header format
