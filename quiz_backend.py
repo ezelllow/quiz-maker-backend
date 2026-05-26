@@ -799,22 +799,43 @@ class QuestionCache:
         self.setup_info_map = {}  # Maps question UID to {'text': ..., 'file_id': ...}
         self.file_map = {}  # Pre-loaded file mapping by name (for faster lookup)
 
-    def load_file_map(self):
-        """Pre-load all files from QUESTION_FOLDER_ID into memory for fast lookup"""
-        if not drive_service or self.file_map:
-            return  # Already loaded or service not available
+    def load_file_map(self, force=False):
+        """Pre-load all files from QUESTION_FOLDER_ID into memory for fast lookup.
+
+        Drive's files.list() returns at most pageSize results per call and
+        gives a nextPageToken if there are more. We loop until the token
+        is gone, so folders larger than 1000 files are fully mapped.
+
+        Pass force=True to re-scan even if file_map is already populated
+        (useful after uploading new images while the server is running).
+        """
+        if not drive_service:
+            return
+        if self.file_map and not force:
+            return  # Already loaded
+
+        if force:
+            self.file_map = {}
 
         try:
-            print("📁 Pre-loading file map from Google Drive...")
+            print("📁 Pre-loading file map from Google Drive (paginated)...")
             query = f"'{QUESTION_FOLDER_ID}' in parents and trashed=false"
-            results = drive_service.files().list(
-                q=query,
-                spaces='drive',
-                fields='files(id, name)',
-                pageSize=1000
-            ).execute()
-
-            files = results.get('files', [])
+            files = []
+            page_token = None
+            while True:
+                results = drive_service.files().list(
+                    q=query,
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name)',
+                    pageSize=1000,
+                    pageToken=page_token,
+                ).execute()
+                page_files = results.get('files', [])
+                files.extend(page_files)
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
+                print(f"   ...loaded {len(files)} so far, fetching next page")
 
             # Create a mapping: lowercase name → file ID
             for f in files:
