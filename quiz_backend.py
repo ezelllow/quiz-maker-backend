@@ -503,6 +503,17 @@ def init_database():
             cursor.execute("ALTER TABLE users ADD COLUMN avatar_url LONGTEXT NULL AFTER name")
             print("🔧 Added avatar_url column to users")
 
+        # equipped (JSON) — wearables per slot.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'equipped'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN equipped JSON NULL AFTER avatar_url")
+            print("🔧 Added equipped column to users")
+
         # XP column (Phase 3 leaderboard). Backfill in the same conditional so
         # we only compute legacy XP exactly once per database.
         cursor.execute("""
@@ -578,6 +589,18 @@ def init_database():
         if cursor.fetchone()[0] == 0:
             cursor.execute("ALTER TABLE users ADD COLUMN test_day_offset INT NOT NULL DEFAULT 0 AFTER daily_goal")
             print("🔧 Added test_day_offset column to users")
+
+        # is_teacher (Teacher Dashboard) — flipped manually in the DB to grant
+        # an account the teacher-dashboard view. There is no API to set this.
+        cursor.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'users'
+              AND COLUMN_NAME = 'is_teacher'
+        """)
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_teacher BOOLEAN NOT NULL DEFAULT FALSE AFTER test_day_offset")
+            print("🔧 Added is_teacher column to users")
 
         # user_rewards (StarQuest §05 — rewards shop). One row per redemption.
         # UNIQUE(user_id, reward_id) enforces once-per-item from the catalogue.
@@ -767,11 +790,14 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
-def create_jwt_token(user_id: int, email: str) -> str:
-    """Create a JWT token for the user"""
+def create_jwt_token(user_id: int, email: str, is_teacher: bool = False) -> str:
+    """Create a JWT token for the user. `is_teacher` is baked into the claim
+    so the frontend can route a teacher straight into the teacher dashboard
+    without a second round-trip."""
     payload = {
         'user_id': user_id,
         'email': email,
+        'is_teacher': bool(is_teacher),
         'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
         'iat': datetime.utcnow()
     }
@@ -786,6 +812,18 @@ def verify_jwt_token(token: str) -> Optional[dict]:
         return None
     except jwt.InvalidTokenError:
         return None
+
+def require_teacher(authorization: Optional[str]) -> dict:
+    """Validate a bearer token and assert the user has the is_teacher claim.
+    Raises 401 if no/invalid token, 403 if not a teacher. Returns the payload."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="No authorization token")
+    payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not payload.get('is_teacher'):
+        raise HTTPException(status_code=403, detail="Teacher access required")
+    return payload
 
 # ============================================================================
 # QUESTION CACHING
@@ -1831,8 +1869,9 @@ async def signup(request: SignupRequest):
 
             user_id = cursor.lastrowid
 
-            # Create JWT token
-            token = create_jwt_token(user_id, request.email)
+            # Create JWT token — new signups are always students; teachers are
+            # promoted manually in the DB.
+            token = create_jwt_token(user_id, request.email, is_teacher=False)
 
             print(f"✅ New user registered: {request.email}")
 
@@ -1850,6 +1889,7 @@ async def signup(request: SignupRequest):
                     'daily_goal': 10,
                     'level':      compute_level(0),
                     'rank':       compute_rank(0),
+                    'is_teacher': False,
                 }
             )
 
@@ -1877,7 +1917,7 @@ async def login(request: LoginRequest):
         try:
             # Find user by email
             cursor.execute(
-                "SELECT id, email, password_hash, name, avatar_url, xp, gems, daily_goal FROM users WHERE email = %s",
+                "SELECT id, email, password_hash, name, avatar_url, xp, gems, daily_goal, is_teacher FROM users WHERE email = %s",
                 (request.email,)
             )
             user = cursor.fetchone()
@@ -1885,14 +1925,15 @@ async def login(request: LoginRequest):
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
-            user_id, email, password_hash, name, avatar_url, user_xp, user_gems, user_daily_goal = user
+            user_id, email, password_hash, name, avatar_url, user_xp, user_gems, user_daily_goal, user_is_teacher = user
 
             # Verify password
             if not verify_password(request.password, password_hash):
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
-            # Create JWT token
-            token = create_jwt_token(user_id, email)
+            # Create JWT token — is_teacher is baked into the claim so the
+            # frontend can route to the teacher dashboard without re-fetching.
+            token = create_jwt_token(user_id, email, bool(user_is_teacher))
 
             print(f"✅ User logged in: {email}")
 
@@ -1910,6 +1951,7 @@ async def login(request: LoginRequest):
                     'daily_goal': int(user_daily_goal or 10),
                     'level':      compute_level(user_xp or 0),
                     'rank':       compute_rank(user_xp or 0),
+                    'is_teacher': bool(user_is_teacher),
                 }
             )
 
@@ -1988,8 +2030,14 @@ async def google_login(request: GoogleLoginRequest):
                     google_daily_goal = 10
                     print(f"✅ New Google user registered: {email}")
 
+            # Fetch is_teacher once so the existing-user, linked-user, and
+            # brand-new-user branches above all converge on the same value.
+            cursor.execute("SELECT is_teacher FROM users WHERE id = %s", (user_id,))
+            _row = cursor.fetchone()
+            google_is_teacher = bool(_row[0]) if _row else False
+
             # Create JWT token
-            token = create_jwt_token(user_id, email)
+            token = create_jwt_token(user_id, email, google_is_teacher)
 
             return AuthResponse(
                 success=True,
@@ -2005,6 +2053,7 @@ async def google_login(request: GoogleLoginRequest):
                     'daily_goal': int(google_daily_goal or 10),
                     'level':      compute_level(google_xp or 0),
                     'rank':       compute_rank(google_xp or 0),
+                    'is_teacher': google_is_teacher,
                 }
             )
 
@@ -2043,7 +2092,7 @@ async def get_user_profile(authorization: str = Header(None)):
 
         try:
             cursor.execute(
-                "SELECT id, email, name, avatar_url, created_at FROM users WHERE id = %s",
+                "SELECT id, email, name, avatar_url, created_at, is_teacher, equipped FROM users WHERE id = %s",
                 (user_id,)
             )
             user = cursor.fetchone()
@@ -2051,7 +2100,8 @@ async def get_user_profile(authorization: str = Header(None)):
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
 
-            user_id, user_email, user_name, user_avatar, created_at = user
+            (user_id, user_email, user_name, user_avatar, created_at,
+             user_is_teacher, user_equipped) = user
 
             return {
                 'success': True,
@@ -2060,7 +2110,13 @@ async def get_user_profile(authorization: str = Header(None)):
                     'email': user_email,
                     'name': user_name,
                     'avatar_url': user_avatar,
-                    'created_at': str(created_at)
+                    'created_at': str(created_at),
+                    'is_teacher': bool(user_is_teacher),
+                    # Include equipped wearables so every screen that
+                    # rehydrates from /api/auth/me (Layout, HomePage,
+                    # Settings, etc.) can render the avatar with hat /
+                    # glasses / hands / legs / accessory / frame.
+                    'equipped': _parse_equipped(user_equipped),
                 }
             }
 
@@ -4372,32 +4428,32 @@ async def get_leaderboard(
         try:
             if period == "alltime":
                 cursor.execute("""
-                    SELECT id, name, avatar_url, COALESCE(xp, 0) AS score
+                    SELECT id, name, avatar_url, equipped, COALESCE(xp, 0) AS score
                     FROM users
                     WHERE name IS NOT NULL AND name <> ''
                     ORDER BY score DESC, id ASC
                 """)
             elif period == "daily":
                 cursor.execute("""
-                    SELECT u.id, u.name, u.avatar_url,
+                    SELECT u.id, u.name, u.avatar_url, u.equipped,
                            COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id AND dc.challenge_date = %s
                     WHERE u.name IS NOT NULL AND u.name <> ''
-                    GROUP BY u.id, u.name, u.avatar_url
+                    GROUP BY u.id, u.name, u.avatar_url, u.equipped
                     ORDER BY score DESC, u.id ASC
                 """, (today,))
             else:  # weekly
                 cursor.execute("""
-                    SELECT u.id, u.name, u.avatar_url,
+                    SELECT u.id, u.name, u.avatar_url, u.equipped,
                            COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id
                      AND dc.challenge_date BETWEEN %s AND %s
                     WHERE u.name IS NOT NULL AND u.name <> ''
-                    GROUP BY u.id, u.name, u.avatar_url
+                    GROUP BY u.id, u.name, u.avatar_url, u.equipped
                     ORDER BY score DESC, u.id ASC
                 """, (monday, sunday))
 
@@ -4411,7 +4467,7 @@ async def get_leaderboard(
         full = []
         prev_score = None
         prev_rank  = 0
-        for idx, (uid, name, avatar_url, score) in enumerate(rows, start=1):
+        for idx, (uid, name, avatar_url, equipped_raw, score) in enumerate(rows, start=1):
             score = int(score or 0)
             if prev_score is None or score != prev_score:
                 rank = idx
@@ -4425,6 +4481,7 @@ async def get_leaderboard(
                 "user_id":    int(uid),
                 "name":       name,
                 "avatar_url": avatar_url,
+                "equipped":   _parse_equipped(equipped_raw),
                 "score":      score,
                 "rank":       rank,
                 "is_me":      int(uid) == me_id,
@@ -4460,16 +4517,175 @@ async def get_leaderboard(
 # items (avatars) unlock instantly.
 # ---------------------------------------------------------------------------
 SHOP_CATALOGUE = [
-    {"id": "sticker_pack",   "name": "CuriousLab Sticker Pack",  "cost": 50,  "emoji": "🌟", "type": "physical", "desc": "Physical sticker pack mailed to you."},
-    {"id": "bookmark",       "name": "Holographic Bookmark",     "cost": 80,  "emoji": "🔖", "type": "physical", "desc": "Limited edition CuriousLab bookmark."},
-    {"id": "avatar_dragon",  "name": "Dragon Avatar",            "cost": 120, "emoji": "🐉", "type": "avatar",   "desc": "Unlock a rare avatar.", "value": "🐉"},
-    {"id": "notebook",       "name": "Curious Notebook",         "cost": 150, "emoji": "📓", "type": "physical", "desc": "A5 dotted notebook with formula reference."},
-    {"id": "bubble_tea",     "name": "Bubble Tea Voucher",       "cost": 200, "emoji": "🧋", "type": "physical", "desc": "$8 voucher at participating shops."},
-    {"id": "avatar_astro",   "name": "Astronaut Avatar",         "cost": 250, "emoji": "🧑‍🚀", "type": "avatar",   "desc": "Unlock a rare avatar.", "value": "🧑‍🚀"},
-    {"id": "tshirt",         "name": "CuriousLab T-Shirt",       "cost": 400, "emoji": "👕", "type": "physical", "desc": "Premium cotton tee. Pick size on redeem."},
-    {"id": "tuition_credit", "name": "1 Free Tuition Session",   "cost": 800, "emoji": "🎓", "type": "high-tier","desc": "One free 1-on-1 CuriousLab session."},
+    # Wearables catalogue — Mr Potato Head style. Each item has a `slot`
+    # and a `rarity` tier. Rarities drive both pricing and the colored
+    # badge in the UI. Pricing benchmarks (earn rate ≈ 25 gems / perfect
+    # 10-Q quiz):
+    #   common    → 150-250   (~6-10 perfect quizzes)
+    #   rare      → 400-600   (~16-24 perfect quizzes)
+    #   epic      → 900-1200  (~36-48 perfect quizzes)
+    #   legendary → 2200-3000 (~88-120 perfect quizzes)
+    # ── Hats ──────────────────────────────────────────────────────
+    {"id": "hat_grad",     "slot": "hat",       "rarity": "common",    "name": "Graduation Cap", "cost": 150,  "emoji": "🎓", "desc": "For the academically inclined."},
+    {"id": "hat_top",      "slot": "hat",       "rarity": "rare",      "name": "Top Hat",        "cost": 450,  "emoji": "🎩", "desc": "Classy. Formal. Iconic."},
+    {"id": "hat_cowboy",   "slot": "hat",       "rarity": "rare",      "name": "Cowboy Hat",     "cost": 550,  "emoji": "🤠", "desc": "Yeehaw. Saddle up."},
+    {"id": "hat_crown",    "slot": "hat",       "rarity": "legendary", "name": "Royal Crown",    "cost": 2500, "emoji": "👑", "desc": "Heavy is the head that wears it."},
+    {"id": "hat_helmet",   "slot": "hat",       "rarity": "rare",      "name": "Military Helmet","cost": 500,  "emoji": "🪖", "desc": "Battle-tested headgear."},
+    {"id": "hat_wizard",   "slot": "hat",       "rarity": "epic",      "name": "Wizard Hat",     "cost": 1100, "emoji": "🧙", "desc": "Channel arcane physics knowledge."},
+
+    # ── Glasses ───────────────────────────────────────────────────
+    {"id": "glasses_round","slot": "glasses",   "rarity": "common",    "name": "Round Glasses",  "cost": 150,  "emoji": "👓", "desc": "Studious and sharp."},
+    {"id": "glasses_sun",  "slot": "glasses",   "rarity": "rare",      "name": "Sunglasses",     "cost": 400,  "emoji": "🕶️", "desc": "Too cool for school."},
+    {"id": "glasses_mono", "slot": "glasses",   "rarity": "epic",      "name": "Monocle",        "cost": 1000, "emoji": "🧐", "desc": "Quite distinguished, I dare say."},
+    {"id": "glasses_vr",   "slot": "glasses",   "rarity": "rare",      "name": "VR Goggles",     "cost": 550,  "emoji": "🥽", "desc": "Step into the metaverse."},
+
+    # ── Accessories (corner badge) ───────────────────────────────
+    {"id": "acc_bow",      "slot": "accessory", "rarity": "common",    "name": "Pink Bow",       "cost": 200,  "emoji": "🎀", "desc": "Cute and pretty."},
+    {"id": "acc_star",     "slot": "accessory", "rarity": "rare",      "name": "Star Pin",       "cost": 450,  "emoji": "⭐", "desc": "A little sparkle."},
+    {"id": "acc_fire",     "slot": "accessory", "rarity": "epic",      "name": "Fire Badge",     "cost": 1100, "emoji": "🔥", "desc": "On fire. Literally."},
+    {"id": "acc_medal",    "slot": "accessory", "rarity": "rare",      "name": "Gold Medal",     "cost": 500,  "emoji": "🎖️", "desc": "Earned, not given."},
+    {"id": "acc_trophy",   "slot": "accessory", "rarity": "epic",      "name": "Trophy",         "cost": 1100, "emoji": "🏆", "desc": "Champion of the cosmos."},
+    {"id": "acc_diamond",  "slot": "accessory", "rarity": "legendary", "name": "Diamond",        "cost": 2800, "emoji": "💎", "desc": "Forged under cosmic pressure."},
+
+    # ── Frames (CSS rings, no emoji rendered on avatar) ──────────
+    {"id": "frame_gold",   "slot": "frame",     "rarity": "epic",      "name": "Gold Frame",     "cost": 1200, "emoji": "🟡", "desc": "Lustrous gold ring.",  "value": "gold"},
+    {"id": "frame_rainbow","slot": "frame",     "rarity": "legendary", "name": "Rainbow Frame",  "cost": 2200, "emoji": "🌈", "desc": "Prismatic ring.",      "value": "rainbow"},
+    {"id": "frame_fire",   "slot": "frame",     "rarity": "legendary", "name": "Flame Frame",    "cost": 3000, "emoji": "🔥", "desc": "Animated fire ring.",  "value": "fire"},
+    {"id": "frame_galaxy", "slot": "frame",     "rarity": "legendary", "name": "Galaxy Frame",   "cost": 2600, "emoji": "🌌", "desc": "Swirling deep-space ring.",   "value": "galaxy"},
+
+    # ── Hands (arms stick out both sides of the avatar) ──────────
+    {"id": "hands_wave",   "slot": "hands",     "rarity": "common",    "name": "Waving Hands",   "cost": 200,  "emoji": "👋", "desc": "Friendly hello on both sides."},
+    {"id": "hands_peace",  "slot": "hands",     "rarity": "common",    "name": "Peace Hands",    "cost": 250,  "emoji": "✌️", "desc": "Twin peace signs."},
+    {"id": "hands_glove",  "slot": "hands",     "rarity": "rare",      "name": "Winter Gloves",  "cost": 500,  "emoji": "🧤", "desc": "Cosy mittens."},
+    {"id": "hands_fist",   "slot": "hands",     "rarity": "rare",      "name": "Power Fists",    "cost": 600,  "emoji": "✊", "desc": "Hold your ground."},
+    {"id": "hands_muscle", "slot": "hands",     "rarity": "epic",      "name": "Flex Arms",      "cost": 1100, "emoji": "💪", "desc": "Show those gains."},
+    {"id": "hands_clap",   "slot": "hands",     "rarity": "rare",      "name": "Clapping Hands", "cost": 450,  "emoji": "👏", "desc": "Round of applause."},
+    {"id": "hands_rock",   "slot": "hands",     "rarity": "epic",      "name": "Rock On!",       "cost": 1000, "emoji": "🤘", "desc": "Stay metal."},
+    {"id": "hands_magic",  "slot": "hands",     "rarity": "legendary", "name": "Magic Hands",    "cost": 2500, "emoji": "✨", "desc": "Sparkle on contact."},
+
+    # ── Legs (two feet stick out from the bottom of the avatar) ──
+    {"id": "legs_sneaker", "slot": "legs",      "rarity": "common",    "name": "Sneakers",       "cost": 200,  "emoji": "👟", "desc": "Light on your feet."},
+    {"id": "legs_boot",    "slot": "legs",      "rarity": "rare",      "name": "Hiking Boots",   "cost": 500,  "emoji": "🥾", "desc": "Built for the climb."},
+    {"id": "legs_dress",   "slot": "legs",      "rarity": "rare",      "name": "Dress Shoes",    "cost": 600,  "emoji": "👞", "desc": "Sharp and polished."},
+    {"id": "legs_cowboy",  "slot": "legs",      "rarity": "epic",      "name": "Cowboy Boots",   "cost": 1000, "emoji": "👢", "desc": "Saddle up partner."},
+    {"id": "legs_ballet",  "slot": "legs",      "rarity": "epic",      "name": "Ballet Slippers","cost": 1200, "emoji": "🩰", "desc": "On your toes."},
+    {"id": "legs_skate",   "slot": "legs",      "rarity": "epic",      "name": "Skateboard",     "cost": 1100, "emoji": "🛹", "desc": "Roll into class."},
+    {"id": "legs_rocket",  "slot": "legs",      "rarity": "legendary", "name": "Rocket Boots",   "cost": 2800, "emoji": "🚀", "desc": "Blast off — physics demands it."},
 ]
 SHOP_BY_ID = {item["id"]: item for item in SHOP_CATALOGUE}
+
+# Number of days a new account must wait before redeeming any shop item.
+# Drives both the /api/shop unlock fields and the /api/shop/redeem gate.
+# Set deliberately high enough that students feel they earned the right to
+# spend — anti-impulse, builds anticipation, prevents "buy and quit" cohorts.
+MIN_ACCOUNT_AGE_DAYS = 7
+
+def _account_age_days(user_id):
+    """Return (age_days, unlocked, days_until_unlock) for the user.
+
+    Reads users.created_at and compares against MIN_ACCOUNT_AGE_DAYS.
+    Defaults to LOCKED (0, False, MIN_ACCOUNT_AGE_DAYS) when created_at
+    is missing — paranoid default; better to make a real user wait one
+    extra day than to let a malformed row bypass the gate."""
+    from datetime import datetime
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT created_at FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+    if not row or row[0] is None:
+        return (0, False, MIN_ACCOUNT_AGE_DAYS)
+    age = max(0, int((datetime.now() - row[0]).days))
+    unlocked = age >= MIN_ACCOUNT_AGE_DAYS
+    return (age, unlocked, max(0, MIN_ACCOUNT_AGE_DAYS - age))
+
+
+
+import json as _json
+
+_WEARABLE_SLOTS = {"hat", "glasses", "accessory", "frame", "hands", "legs"}
+
+
+def _parse_equipped(raw):
+    """Normalise the equipped JSON column into a dict keyed by every slot."""
+    out = {slot: None for slot in _WEARABLE_SLOTS}
+    if not raw:
+        return out
+    try:
+        data = raw if isinstance(raw, dict) else _json.loads(raw)
+    except Exception:
+        return out
+    for slot in _WEARABLE_SLOTS:
+        v = data.get(slot)
+        if isinstance(v, str) and v.strip():
+            out[slot] = v
+    return out
+
+
+class ShopEquipRequest(BaseModel):
+    reward_id: Optional[str] = None  # None / empty = unequip
+    slot: Optional[str] = None       # Inferred from catalogue when reward_id present
+
+
+@app.post("/api/shop/equip")
+async def equip_reward(request: ShopEquipRequest, authorization: str = Header(None)):
+    """Equip / unequip a wearable. Two modes:
+       • reward_id set → put in its slot (must own)
+       • reward_id empty + slot set → clear that slot
+    """
+    try:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="No authorization token")
+        payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user_id = payload.get("user_id")
+
+        target_slot = request.slot
+        if request.reward_id:
+            item = SHOP_BY_ID.get(request.reward_id)
+            if not item:
+                raise HTTPException(status_code=404, detail=f"Unknown item: {request.reward_id}")
+            target_slot = item.get("slot")
+        if target_slot not in _WEARABLE_SLOTS:
+            raise HTTPException(status_code=400, detail=f"Unknown slot: {target_slot}")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            if request.reward_id:
+                cursor.execute(
+                    "SELECT 1 FROM user_rewards WHERE user_id = %s AND reward_id = %s",
+                    (user_id, request.reward_id),
+                )
+                if not cursor.fetchone():
+                    raise HTTPException(status_code=400, detail="You do not own this item")
+
+            cursor.execute("SELECT equipped FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
+            equipped = _parse_equipped(row[0] if row else None)
+            equipped[target_slot] = request.reward_id or None
+            cursor.execute(
+                "UPDATE users SET equipped = %s WHERE id = %s",
+                (_json.dumps(equipped), user_id),
+            )
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+        return {"success": True, "equipped": equipped}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/shop/equip: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/shop")
@@ -4495,14 +4711,24 @@ async def get_shop(authorization: str = Header(None)):
                 (user_id,),
             )
             owned = [r[0] for r in cursor.fetchall()]
+
+            cursor.execute("SELECT equipped FROM users WHERE id = %s", (user_id,))
+            erow = cursor.fetchone()
+            equipped = _parse_equipped(erow[0] if erow else None)
         finally:
             cursor.close()
             conn.close()
 
+        age_days, shop_unlocked, days_until_unlock = _account_age_days(user_id)
         return {
-            "gems":      gems,
-            "owned":     owned,
-            "catalogue": SHOP_CATALOGUE,
+            "gems":                 gems,
+            "owned":                owned,
+            "equipped":             equipped,
+            "catalogue":            SHOP_CATALOGUE,
+            "account_age_days":     age_days,
+            "shop_unlocked":        shop_unlocked,
+            "days_until_unlock":    days_until_unlock,
+            "min_account_age_days": MIN_ACCOUNT_AGE_DAYS,
         }
     except HTTPException:
         raise
@@ -4526,6 +4752,16 @@ async def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(
         if not payload:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         user_id = payload.get("user_id")
+
+        # Account-age gate: brand-new users can't redeem until they've
+        # played for MIN_ACCOUNT_AGE_DAYS. Mirrors /api/shop's shop_unlocked
+        # field so the UI and backend never disagree.
+        _, _unlocked, _days_left = _account_age_days(user_id)
+        if not _unlocked:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Shop unlocks in {_days_left} day{'' if _days_left == 1 else 's'}. Keep practicing!",
+            )
 
         item = SHOP_BY_ID.get(request.reward_id)
         if not item:
@@ -4607,11 +4843,285 @@ async def startup_event():
 
 
 # ============================================================================
-# RUN SERVER
+# TEACHER DASHBOARD
 # ============================================================================
+# Read-only overview for accounts flagged with is_teacher. Single endpoint so
+# the dashboard loads with one round-trip. No write paths; teachers cannot
+# touch student records. Promotion happens manually in the DB
+# (UPDATE users SET is_teacher = TRUE WHERE email = ...).
 
+@app.get("/api/teacher/overview")
+async def get_teacher_overview(
+    authorization: str = Header(None),
+    quiz_type: Optional[str] = None,
+):
+    """Teacher dashboard payload — one round-trip returns:
+      - week_at_a_glance: totals across the student body for the last 7 days.
+      - weakest_topics: subtopics where the class collectively struggled,
+        ranked worst-first, with the names of the students who scored <60%.
+      - inactive_students: students silent 5+ days or never active.
+
+    `quiz_type` filters every stat to one slice of the quiz_attempts table:
+      - omitted / 'all' -> Daily Challenge + Practice (everything)
+      - 'daily'         -> only daily-challenge attempts
+      - 'practice'      -> only practice attempts
+    Any other value falls back to 'all'.
+
+    Requires the is_teacher JWT claim. 403 otherwise."""
+    require_teacher(authorization)
+
+    # Whitelist the value before splicing it into SQL — only two literal
+    # strings are accepted, so the f-string substitution below is safe.
+    qt = (quiz_type or "").strip().lower()
+    if qt not in ("daily", "practice"):
+        qt = "all"
+    qt_clause = f" AND qa.quiz_type = '{qt}'" if qt in ("daily", "practice") else ""
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # 1) Weakest topics in the last 7 days. A topic qualifies if the class
+        # average is under 70 OR at least two students scored under 60. Sort by
+        # the share of students struggling first, then by raw average.
+        cursor.execute(f"""
+            SELECT
+              qa.subtopic,
+              COUNT(DISTINCT qa.user_id) AS students_attempted,
+              COUNT(qa.id) AS attempts,
+              ROUND(AVG(qa.percentage), 1) AS avg_pct,
+              COUNT(DISTINCT CASE WHEN qa.percentage < 60 THEN qa.user_id END) AS struggling_count,
+              GROUP_CONCAT(DISTINCT
+                  CASE WHEN qa.percentage < 60 THEN qa.user_id END
+              ) AS struggling_ids
+            FROM quiz_attempts qa
+            JOIN users u ON u.id = qa.user_id
+            WHERE u.is_teacher = FALSE
+              AND qa.attempted_at >= NOW() - INTERVAL 7 DAY
+              AND qa.subtopic IS NOT NULL AND qa.subtopic <> ''
+              AND qa.percentage IS NOT NULL
+              {qt_clause}
+            GROUP BY qa.subtopic
+            HAVING avg_pct < 70 OR struggling_count >= 2
+            ORDER BY
+              (struggling_count * 100.0 / NULLIF(students_attempted, 0)) DESC,
+              avg_pct ASC
+            LIMIT 8
+        """)
+        weak_rows = cursor.fetchall()
+
+        # Collect every struggling student id so we can resolve names in one
+        # follow-up query rather than N round-trips.
+        weak_ids = set()
+        for row in weak_rows:
+            ids_csv = row[5]
+            if ids_csv:
+                for x in str(ids_csv).split(","):
+                    x = x.strip()
+                    if x:
+                        weak_ids.add(int(x))
+
+        # 2) Inactive students. Pure inactivity bucket — silent 5+ days or
+        # never active. Low-accuracy students show up under Weakest Topics
+        # (their names are in the struggling-students expansion), so this
+        # section is just "who needs a WhatsApp nudge right now."
+        cursor.execute(f"""
+            SELECT
+              u.id, u.name, u.email,
+              MAX(qa.attempted_at) AS last_active,
+              ROUND(AVG(qa.percentage), 1) AS recent_avg_pct,
+              COUNT(qa.id) AS recent_attempts
+            FROM users u
+            LEFT JOIN quiz_attempts qa
+              ON qa.user_id = u.id
+             AND qa.attempted_at >= NOW() - INTERVAL 14 DAY
+             {qt_clause}
+            WHERE u.is_teacher = FALSE
+            GROUP BY u.id, u.name, u.email
+            HAVING last_active IS NULL
+                OR DATEDIFF(NOW(), last_active) >= 5
+            ORDER BY
+              CASE WHEN last_active IS NULL THEN 0 ELSE 1 END,
+              last_active ASC
+            LIMIT 20
+        """)
+        inactive_rows = cursor.fetchall()
+
+        # 3) Week at a glance / class pulse. ALWAYS unfiltered — these are
+        # the "is the class healthy?" headline stats that sit above the toggle.
+        # The toggle only narrows the deep-dive sections (weakest topics,
+        # inactive list, consistency rows), not these top-line numbers.
+        cursor.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM users WHERE is_teacher = FALSE) AS total_students,
+              COUNT(DISTINCT qa.user_id) AS active_students,
+              COUNT(qa.id) AS total_quizzes,
+              ROUND(AVG(qa.percentage), 1) AS class_avg_pct,
+              ROUND(
+                100.0 * SUM(CASE WHEN qa.percentage >= 60 THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(qa.id), 0),
+                1
+              ) AS pass_rate_pct
+            FROM quiz_attempts qa
+            JOIN users u ON u.id = qa.user_id
+            WHERE u.is_teacher = FALSE
+              AND qa.attempted_at >= NOW() - INTERVAL 7 DAY
+        """)
+        week_row = cursor.fetchone() or (0, 0, 0, None, None)
+
+        # 3b) Class-pulse inactive count: how many students would the Inactive
+        # list show if the filter were "all"? Used by the Inactive tile so the
+        # tile stays stable even when the filter narrows the list below.
+        cursor.execute("""
+            SELECT COUNT(*) FROM (
+              SELECT u.id
+              FROM users u
+              LEFT JOIN quiz_attempts qa
+                ON qa.user_id = u.id
+               AND qa.attempted_at >= NOW() - INTERVAL 14 DAY
+              WHERE u.is_teacher = FALSE
+              GROUP BY u.id
+              HAVING MAX(qa.attempted_at) IS NULL
+                  OR DATEDIFF(NOW(), MAX(qa.attempted_at)) >= 5
+            ) AS x
+        """)
+        inactive_count_class = int((cursor.fetchone() or (0,))[0] or 0)
+
+        # 4) Per-student consistency: how many of the last 7 days each student
+        # showed up, plus quiz volume and streak length. Sorted most-consistent
+        # first so the teacher can scan top-to-bottom.
+        cursor.execute(f"""
+            SELECT
+              u.id, u.name,
+              COUNT(DISTINCT DATE(qa.attempted_at)) AS days_active_7d,
+              COUNT(qa.id) AS quizzes_7d,
+              MAX(qa.attempted_at) AS last_active,
+              COALESCE(s.current_streak, 0) AS current_streak,
+              COALESCE(s.longest_streak, 0) AS longest_streak
+            FROM users u
+            LEFT JOIN quiz_attempts qa
+              ON qa.user_id = u.id
+             AND qa.attempted_at >= NOW() - INTERVAL 7 DAY
+             {qt_clause}
+            LEFT JOIN streaks s ON s.user_id = u.id
+            WHERE u.is_teacher = FALSE
+            GROUP BY u.id, u.name, s.current_streak, s.longest_streak
+            ORDER BY days_active_7d DESC, quizzes_7d DESC, u.name ASC
+        """)
+        consistency_rows = cursor.fetchall()
+
+        # Resolve struggling-student ids -> names in one query.
+        id_to_name = {}
+        if weak_ids:
+            fmt = ",".join(["%s"] * len(weak_ids))
+            cursor.execute(
+                f"SELECT id, name FROM users WHERE id IN ({fmt})",
+                tuple(weak_ids)
+            )
+            for uid, uname in cursor.fetchall():
+                id_to_name[int(uid)] = uname or "Student"
+
+        # Shape the response.
+        weakest_topics = []
+        for row in weak_rows:
+            subtopic, students_attempted, attempts, avg_pct, struggling_count, ids_csv = row
+            ids = []
+            if ids_csv:
+                for x in str(ids_csv).split(","):
+                    x = x.strip()
+                    if x:
+                        ids.append(int(x))
+            weakest_topics.append({
+                "topic":               subtopic,
+                "students_attempted":  int(students_attempted or 0),
+                "attempts":            int(attempts or 0),
+                "avg_pct":             float(avg_pct) if avg_pct is not None else None,
+                "struggling_count":    int(struggling_count or 0),
+                "struggling_students": [
+                    {"id": uid, "name": id_to_name.get(uid, "Student")}
+                    for uid in ids
+                ],
+            })
+
+        now = datetime.utcnow()
+        inactive_students = []
+        for row in inactive_rows:
+            uid, uname, uemail, last_active, recent_avg_pct, recent_attempts = row
+            inactive_students.append({
+                "id":              int(uid),
+                "name":            uname or "Student",
+                "email":           uemail,
+                "last_active":     str(last_active) if last_active else None,
+                "days_since":      ((now - last_active).days if last_active else None),
+                "recent_avg_pct":  float(recent_avg_pct) if recent_avg_pct is not None else None,
+                "recent_attempts": int(recent_attempts or 0),
+            })
+
+        total_students, active_students, total_quizzes, class_avg_pct, pass_rate_pct = week_row
+        avg_quizzes_per_active = (
+            round(int(total_quizzes or 0) / int(active_students), 1)
+            if active_students else 0
+        )
+
+        # Shape per-student consistency rows and the class-level summary.
+        consistency = []
+        days_sum = 0
+        days_count = 0
+        streak_3plus = 0
+        for row in consistency_rows:
+            uid, uname, days, quizzes, last_active, cur_streak, long_streak = row
+            days_int = int(days or 0)
+            consistency.append({
+                "id":             int(uid),
+                "name":           uname or "Student",
+                "days_active_7d": days_int,
+                "quizzes_7d":     int(quizzes or 0),
+                "last_active":    str(last_active) if last_active else None,
+                "current_streak": int(cur_streak or 0),
+                "longest_streak": int(long_streak or 0),
+            })
+            days_sum += days_int
+            days_count += 1
+            if int(cur_streak or 0) >= 3:
+                streak_3plus += 1
+
+        consistency_summary = {
+            "avg_days_active":            round(days_sum / days_count, 1) if days_count else 0,
+            "students_with_streak_3plus": streak_3plus,
+            "total_students_listed":      days_count,
+        }
+
+        return {
+            "success":      True,
+            "generated_at": now.isoformat() + "Z",
+            "window_days":  7,
+            "filter":       qt,
+            "week_at_a_glance": {
+                "total_students":         int(total_students or 0),
+                "active_students":        int(active_students or 0),
+                "total_quizzes":          int(total_quizzes or 0),
+                "class_avg_pct":          float(class_avg_pct) if class_avg_pct is not None else None,
+                "avg_quizzes_per_active": float(avg_quizzes_per_active),
+                "pass_rate_pct":          float(pass_rate_pct) if pass_rate_pct is not None else None,
+                "inactive_count":         inactive_count_class,
+            },
+            "weakest_topics":      weakest_topics,
+            "inactive_students":   inactive_students,
+            "consistency":         consistency,
+            "consistency_summary": consistency_summary,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/teacher/overview: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Entry point ──────────────────────────────────────────────────────────
+# Runs the FastAPI app via uvicorn when executed directly (`python
+# quiz_backend.py`). Reload is OFF because the startup hook performs schema
+# migrations and reload would run them twice + spawn duplicate workers.
+# For dev hot-reload, run instead:  uvicorn quiz_backend:app --reload
 if __name__ == "__main__":
     import uvicorn
-    print("\U0001f3af Starting HabitGo Backend...")
-    print("\U0001f4da API docs: http://localhost:8000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
