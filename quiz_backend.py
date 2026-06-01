@@ -1788,6 +1788,11 @@ async def serve_image(file_id: str):
     Backend image proxy endpoint.
     Serves Google Drive images, cached in memory after the first fetch.
     Bypasses Google Drive embedding restrictions.
+
+    Accepts either a real Drive file ID (1Abc...) or a filename / UID
+    (PHY-CHIJ2022-P1-Pure-033-). For filename inputs we resolve through
+    cache.file_map before hitting Drive — otherwise Drive responds 404
+    because get_media() needs the actual ID, never the display name.
     """
     try:
         # Fast path — already in the in-memory cache.
@@ -1798,8 +1803,40 @@ async def serve_image(file_id: str):
         if not drive_service:
             raise HTTPException(status_code=500, detail="Google Drive service not initialized")
 
+        # ── Resolve filename → Drive ID via the pre-loaded file_map ──
+        # The /api/image route used to call get_media() with whatever
+        # arrived in the URL. That works for real Drive IDs but 404s
+        # when the URL holds a filename / UID. Now we try the file_map
+        # first; if it has the input (with or without an extension, or
+        # as a prefix), swap to the actual Drive ID before downloading.
+        resolved_id = file_id
+        if cache.file_map:
+            fm = cache.file_map
+            candidates = [file_id, file_id.lower()]
+            for ext in ('', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.PNG', '.JPG'):
+                for base in candidates:
+                    key = base + ext
+                    if key in fm:
+                        resolved_id = fm[key]
+                        print(f"  🔍 [serve_image] '{file_id}' → '{resolved_id}' via file_map[{key!r}]")
+                        break
+                if resolved_id != file_id:
+                    break
+
+            # Prefix-match fallback — handles the trailing-hyphen case
+            # where the DB has "PHY-CHIJ2022-P1-Pure-033-" but Drive has
+            # "PHY-CHIJ2022-P1-Pure-033-Setup.png". We pick the FIRST
+            # match by name (stable enough for setup/options diagrams).
+            if resolved_id == file_id and len(file_id) >= 6:
+                prefix_l = file_id.lower()
+                hits = [(k, v) for k, v in fm.items() if k.startswith(prefix_l)]
+                if hits:
+                    hits.sort(key=lambda kv: (len(kv[0]), kv[0]))
+                    resolved_id = hits[0][1]
+                    print(f"  🔍 [serve_image] '{file_id}' → '{resolved_id}' via prefix '{hits[0][0]}' ({len(hits)} candidates)")
+
         # Download file from Google Drive
-        request = drive_service.files().get_media(fileId=file_id)
+        request = drive_service.files().get_media(fileId=resolved_id)
         downloader = request.execute()
         if isinstance(downloader, bytes):
             data = downloader
@@ -1813,21 +1850,27 @@ async def serve_image(file_id: str):
                 buf.write(chunk)
             data = buf.getvalue()
 
-        # Store in the cache (simple FIFO eviction once the cap is reached).
+        # Store in the cache under BOTH the original URL key and the
+        # resolved Drive ID so subsequent requests with either form hit
+        # the fast path.
         if len(_IMAGE_CACHE) >= _IMAGE_CACHE_MAX:
             try:
                 _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
             except StopIteration:
                 pass
         _IMAGE_CACHE[file_id] = data
+        if resolved_id != file_id:
+            _IMAGE_CACHE[resolved_id] = data
 
         return Response(content=data, media_type="image/png", headers=_IMAGE_HEADERS)
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error serving image {file_id}: {e}")
-        raise HTTPException(status_code=404, detail=f"Could not load image: {str(e)}")
+        # Include both the requested key AND the resolved ID in the log
+        # so it's obvious whether the lookup found anything.
+        print(f"❌ Error serving image {file_id} (resolved → {resolved_id}): {e}")
+        raise HTTPException(status_code=404, detail=f"Could not load image '{file_id}': {str(e)}")
 
 
 # ============================================================================
@@ -5115,6 +5158,213 @@ async def get_teacher_overview(
     except Exception as e:
         print(f"❌ Error in /api/teacher/overview: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/teacher/students/{user_id}")
+async def get_teacher_student_detail(user_id: int, authorization: str = Header(None)):
+    """Single-student drill-in: card data + the last 50 attempts (summary only).
+    Teachers click a student row in the dashboard to land here. Each attempt
+    is a slim summary; click an attempt to fetch its full per-question detail
+    via /api/teacher/attempts/{id}."""
+    require_teacher(authorization)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, name, email, created_at, is_teacher FROM users WHERE id = %s",
+            (user_id,)
+        )
+        u = cursor.fetchone()
+        if not u:
+            raise HTTPException(status_code=404, detail="Student not found")
+        u_id, u_name, u_email, u_created, u_is_teacher = u
+        if u_is_teacher:
+            raise HTTPException(status_code=400, detail="Target is a teacher, not a student")
+
+        cursor.execute(
+            "SELECT current_streak, longest_streak FROM streaks WHERE user_id = %s",
+            (u_id,)
+        )
+        srow = cursor.fetchone()
+        current_streak, longest_streak = (int(srow[0] or 0), int(srow[1] or 0)) if srow else (0, 0)
+
+        cursor.execute(
+            "SELECT COUNT(*), ROUND(AVG(percentage), 1) FROM quiz_attempts WHERE user_id = %s",
+            (u_id,)
+        )
+        trow = cursor.fetchone() or (0, None)
+        total_attempts = int(trow[0] or 0)
+        lifetime_avg_pct = float(trow[1]) if trow[1] is not None else None
+
+        cursor.execute("""
+            SELECT id, name, subtopic, difficulty, score, percentage, total_questions,
+                   time_spent_seconds, quiz_type, attempted_at
+            FROM quiz_attempts
+            WHERE user_id = %s
+            ORDER BY attempted_at DESC
+            LIMIT 50
+        """, (u_id,))
+        rows = cursor.fetchall()
+
+        attempts = []
+        for r in rows:
+            a_id, a_name, a_sub, a_diff, a_score, a_pct, a_total, a_time, a_type, a_when = r
+            attempts.append({
+                "id":              int(a_id),
+                "name":            a_name,
+                "subtopic":        a_sub,
+                "difficulty":      a_diff,
+                "score":           int(a_score or 0),
+                "percentage":      int(a_pct or 0),
+                "total_questions": int(a_total or 0),
+                "time_spent_seconds": int(a_time or 0),
+                "quiz_type":       (a_type or "practice"),
+                "attempted_at":    str(a_when) if a_when else None,
+            })
+
+        return {
+            "success": True,
+            "student": {
+                "id":               int(u_id),
+                "name":             u_name or "Student",
+                "email":            u_email,
+                "created_at":       str(u_created) if u_created else None,
+                "current_streak":   current_streak,
+                "longest_streak":   longest_streak,
+                "total_attempts":   total_attempts,
+                "lifetime_avg_pct": lifetime_avg_pct,
+            },
+            "attempts": attempts,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/teacher/students/{user_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/api/teacher/attempts/{attempt_id}")
+async def get_teacher_attempt_detail(attempt_id: int, authorization: str = Header(None)):
+    """Full per-question review for one attempt. Same shape as the student
+    retake endpoint, but gated by is_teacher instead of attempt ownership."""
+    require_teacher(authorization)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, user_id, name, difficulty, subtopic, score, percentage,
+                   total_questions, time_spent_seconds, questions_data,
+                   quiz_type, attempted_at
+            FROM quiz_attempts
+            WHERE id = %s
+        """, (attempt_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        (a_id, a_user_id, a_name, a_diff, a_sub, a_score, a_pct, a_total,
+         a_time, a_qjson, a_type, a_when) = row
+
+        import json
+        questions_data = []
+        try:
+            questions_data = json.loads(a_qjson) if a_qjson else []
+        except Exception as je:
+            print(f"⚠️  Failed to parse questions_data for attempt {a_id}: {je}")
+            questions_data = []
+
+        # Re-hydrate skinny legacy rows from the in-memory cache so the review
+        # page has full question/options/diagram fields even on attempts saved
+        # before the full questions_data shape existed. Mirrors the retake
+        # endpoint logic.
+        if any(not q.get('options') and not q.get('table_rows') for q in questions_data):
+            if not cache.is_loaded:
+                cache.load_questions()
+            by_qno  = {q.qno: q for q in cache.questions if q.qno}
+            by_text = {q.question_text.strip(): q for q in cache.questions if q.question_text}
+            for i, q in enumerate(questions_data):
+                if q.get('options') or q.get('table_rows'):
+                    continue
+                full = (by_qno.get(q.get('qno'))
+                        or by_text.get((q.get('question_text') or '').strip()))
+                if not full:
+                    continue
+                questions_data[i] = {
+                    'qno':                  full.qno,
+                    'uid':                  full.uid,
+                    'subtopic':             full.subtopic,
+                    'difficulty':           full.difficulty,
+                    'level':                full.level,
+                    'question_text':        full.question_text,
+                    'options':              full.options,
+                    'answer':               full.answer,
+                    'option_type':          full.option_type,
+                    'table_headers':        full.table_headers,
+                    'table_header_levels':  full.table_header_levels,
+                    'table_header_colspan': full.table_header_colspan,
+                    'table_rows':           full.table_rows,
+                    'diagram_file_id':      full.diagram_file_id,
+                    'options_image_uid':    full.options_image_uid,
+                    'image_url':            full.image_url,
+                    'setup_image_url':      full.setup_image_url,
+                    'explanation':          full.explanation,
+                    'user_answer':          q.get('user_answer'),
+                    'correct_answer':       q.get('correct_answer') or full.answer,
+                    'is_correct':           q.get('is_correct', False),
+                }
+
+        # Resolve diagram + options-image file IDs to URLs the frontend can
+        # render directly (mirrors the retake endpoint).
+        for q in questions_data:
+            if q.get('diagram_file_id'):
+                actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                if actual_file_id:
+                    q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
+            if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
+                options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                if options_file_id:
+                    q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
+            elif q.get('setup_image_url') and not q.get('image_url'):
+                q['image_url'] = q['setup_image_url']
+
+        cursor.execute("SELECT name, email FROM users WHERE id = %s", (a_user_id,))
+        urow = cursor.fetchone() or (None, None)
+        student_name, student_email = urow
+
+        return {
+            "success": True,
+            "attempt": {
+                "id":                int(a_id),
+                "user_id":           int(a_user_id),
+                "student_name":      student_name or "Student",
+                "student_email":     student_email,
+                "name":              a_name,
+                "difficulty":        a_diff,
+                "subtopic":          a_sub,
+                "score":             int(a_score or 0),
+                "percentage":        int(a_pct or 0),
+                "total_questions":   int(a_total or 0),
+                "time_spent_seconds": int(a_time or 0),
+                "quiz_type":         (a_type or "practice"),
+                "attempted_at":      str(a_when) if a_when else None,
+                "questions":         questions_data,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in /api/teacher/attempts/{attempt_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
