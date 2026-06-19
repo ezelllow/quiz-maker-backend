@@ -40,9 +40,14 @@ QUESTION_FOLDER_ID = '10TtAVgxTsczSFxIrkwSSy_KFQlebWCiX'
 # per-paper subfolders (new layout). If the Pure / Combined physics images live
 # in their own separate Drive folders, add those folder IDs here via the
 # QUESTION_FOLDER_IDS env var (comma-separated). Defaults to QUESTION_FOLDER_ID.
+_DEFAULT_QUESTION_FOLDER_IDS = ','.join([
+    QUESTION_FOLDER_ID,                      # legacy flat folder (un-migrated papers)
+    '1c3e88WMHQ62uG1AZ4VDeK_d5tMwPwFqO',     # Pure Physics drive (per-paper subfolders)
+    '1IH-v6RCDsEnYm8oeJS7RaIhSicHhNFcC',     # Combined (4E5N) Physics drive (per-paper subfolders)
+])
 QUESTION_FOLDER_IDS = [
     fid.strip()
-    for fid in (os.getenv('QUESTION_FOLDER_IDS') or QUESTION_FOLDER_ID).split(',')
+    for fid in (os.getenv('QUESTION_FOLDER_IDS') or _DEFAULT_QUESTION_FOLDER_IDS).split(',')
     if fid.strip()
 ]
 # Sheet tab names to read questions from. The workbook now splits Pure vs
