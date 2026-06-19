@@ -35,7 +35,25 @@ load_dotenv()
 
 SPREADSHEET_ID = '1TOmLo9UNpzOggeX27j1p6Q2NdAnCWpRJ1ErYAEJ-sZU'
 QUESTION_FOLDER_ID = '10TtAVgxTsczSFxIrkwSSy_KFQlebWCiX'
-SHEET_NAME = 'Physics'  # Just the sheet name, no range
+# Root Drive folder(s) scanned for question images. The scan is RECURSIVE, so
+# images resolve whether they sit directly in a folder (old flat layout) or in
+# per-paper subfolders (new layout). If the Pure / Combined physics images live
+# in their own separate Drive folders, add those folder IDs here via the
+# QUESTION_FOLDER_IDS env var (comma-separated). Defaults to QUESTION_FOLDER_ID.
+QUESTION_FOLDER_IDS = [
+    fid.strip()
+    for fid in (os.getenv('QUESTION_FOLDER_IDS') or QUESTION_FOLDER_ID).split(',')
+    if fid.strip()
+]
+# Sheet tab names to read questions from. The workbook now splits Pure vs
+# 4E5N into separate tabs (it used to be one tab called 'Physics'). Override
+# with the SHEET_NAMES env var ("4E5N,Pure Physics") if you rename tabs.
+# SHEET_NAME (singular) is still honoured for backward compatibility.
+SHEET_NAMES = [
+    name.strip()
+    for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or '4E5N,Pure Physics').split(',')
+    if name.strip()
+]
 
 # Google API Scopes
 SCOPES = [
@@ -53,7 +71,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # JWT Configuration
 JWT_SECRET = os.getenv("JWT_SECRET", "change_this_secret_key_in_production")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
+JWT_EXPIRATION_HOURS = 720  # 30 days — long sessions during dev; avoids frequent re-logins
 
 # MySQL Configuration
 DB_CONFIG = {
@@ -838,11 +856,16 @@ class QuestionCache:
         self.file_map = {}  # Pre-loaded file mapping by name (for faster lookup)
 
     def load_file_map(self, force=False):
-        """Pre-load all files from QUESTION_FOLDER_ID into memory for fast lookup.
+        """Pre-load every image under QUESTION_FOLDER_IDS into memory for lookup.
+
+        Walks each root folder RECURSIVELY (Google Drive is a tree of folders),
+        so images resolve whether they live directly in a folder (old flat
+        layout) OR inside per-paper subfolders (new layout). Files are still
+        keyed by name, so the Sheet keeps referencing them by filename/UID
+        exactly as before — nothing about the question rows has to change.
 
         Drive's files.list() returns at most pageSize results per call and
-        gives a nextPageToken if there are more. We loop until the token
-        is gone, so folders larger than 1000 files are fully mapped.
+        gives a nextPageToken if there are more; we page until it's gone.
 
         Pass force=True to re-scan even if file_map is already populated
         (useful after uploading new images while the server is running).
@@ -855,42 +878,52 @@ class QuestionCache:
         if force:
             self.file_map = {}
 
+        FOLDER_MIME = 'application/vnd.google-apps.folder'
         try:
-            print("📁 Pre-loading file map from Google Drive (paginated)...")
-            query = f"'{QUESTION_FOLDER_ID}' in parents and trashed=false"
+            print(f"📁 Pre-loading file map from Google Drive (recursive) — roots: {QUESTION_FOLDER_IDS}")
             files = []
-            page_token = None
-            while True:
-                results = drive_service.files().list(
-                    q=query,
-                    spaces='drive',
-                    fields='nextPageToken, files(id, name)',
-                    pageSize=1000,
-                    pageToken=page_token,
-                ).execute()
-                page_files = results.get('files', [])
-                files.extend(page_files)
-                page_token = results.get('nextPageToken')
-                if not page_token:
-                    break
-                print(f"   ...loaded {len(files)} so far, fetching next page")
+            seen_folders = set()
+            queue = list(QUESTION_FOLDER_IDS)   # breadth-first folder walk
+            while queue:
+                folder_id = queue.pop(0)
+                if not folder_id or folder_id in seen_folders:
+                    continue
+                seen_folders.add(folder_id)
+                page_token = None
+                while True:
+                    results = drive_service.files().list(
+                        q=f"'{folder_id}' in parents and trashed=false",
+                        spaces='drive',
+                        fields='nextPageToken, files(id, name, mimeType)',
+                        pageSize=1000,
+                        pageToken=page_token,
+                        # Work for both My Drive and Shared Drives.
+                        includeItemsFromAllDrives=True,
+                        supportsAllDrives=True,
+                    ).execute()
+                    for f in results.get('files', []):
+                        if f.get('mimeType') == FOLDER_MIME:
+                            queue.append(f['id'])        # descend into subfolder
+                        else:
+                            files.append(f)
+                    page_token = results.get('nextPageToken')
+                    if not page_token:
+                        break
 
-            # Create a mapping: lowercase name → file ID
+            # Map name → file ID. setdefault = first occurrence wins, so a file
+            # found in a shallower folder isn't clobbered by a same-named file
+            # deeper down. Keep image filenames unique across papers.
             for f in files:
                 name = f['name']
                 file_id = f['id']
-
-                # Store by exact name and lowercase name
-                self.file_map[name] = file_id
-                self.file_map[name.lower()] = file_id
-
-                # Also store without extension for flexibility
+                self.file_map.setdefault(name, file_id)
+                self.file_map.setdefault(name.lower(), file_id)
                 if '.' in name:
                     name_no_ext = name.rsplit('.', 1)[0]
-                    self.file_map[name_no_ext] = file_id
-                    self.file_map[name_no_ext.lower()] = file_id
+                    self.file_map.setdefault(name_no_ext, file_id)
+                    self.file_map.setdefault(name_no_ext.lower(), file_id)
 
-            print(f"✅ Loaded {len(files)} files into memory for fast lookup")
+            print(f"✅ Loaded {len(files)} image files from {len(seen_folders)} folder(s) for fast lookup")
             return
 
         except Exception as e:
@@ -950,18 +983,43 @@ class QuestionCache:
             raise RuntimeError("Google Sheets API not initialized")
 
         try:
-            result = sheets_service.spreadsheets().values().get(
+            # The workbook now holds questions across multiple tabs (Pure +
+            # 4E5N). One batchGet fetches them all in a single API call; each
+            # tab is its own valueRange in the response.
+            batch = sheets_service.spreadsheets().values().batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                range=SHEET_NAME
+                ranges=SHEET_NAMES,
             ).execute()
+            value_ranges = batch.get('valueRanges', [])
 
-            rows = result.get('values', [])
+            # Merge all tabs into one rows list. The header row from the FIRST
+            # non-empty tab wins; data rows from every tab are appended (their
+            # own header rows are skipped).
+            rows = []
+            headers = None
+            per_tab_counts = []
+            for tab_name, vr in zip(SHEET_NAMES, value_ranges):
+                tab_rows = vr.get('values', [])
+                if not tab_rows:
+                    per_tab_counts.append(f"{tab_name}: 0")
+                    continue
+                tab_header = tab_rows[0]
+                tab_data = tab_rows[1:]
+                if headers is None:
+                    headers = tab_header
+                    rows.append(tab_header)
+                # Append data rows. We deliberately do NOT enforce header
+                # equality across tabs; the column-index map below is built
+                # off the first tab's headers and the per-row width handling
+                # already pads short rows with empty strings.
+                rows.extend(tab_data)
+                per_tab_counts.append(f"{tab_name}: {len(tab_data)} rows")
+
             if not rows:
-                print("⚠️  No questions found in sheet")
+                print(f"⚠️  No questions found across tabs: {SHEET_NAMES}")
                 return
 
-            # First row is header
-            headers = rows[0]
+            print(f"📚 Loaded tabs — {' · '.join(per_tab_counts)}")
             print(f"📋 Headers: {headers}")
 
             # Create column index map
@@ -1047,7 +1105,7 @@ class QuestionCache:
                     question = Question(
                         uid=uid,
                         qno=qno,
-                        subtopic=subtopic,
+                        subtopic=canonical_topic(subtopic),
                         difficulty=difficulty,
                         level=level,
                         subject=subject or 'Physics',
@@ -1336,6 +1394,7 @@ PURE_TOPIC_ORDER = [
     "Thermal Processes",
     "Thermal Properties of Matter",
     "General Properties of Waves",
+    "Sound",
     "Electromagnetic Spectrum",
     "Light",
     "Static Electricity",
@@ -1353,11 +1412,14 @@ COMBINED_TOPIC_ORDER = [
     "Kinematics",
     "Force and Pressure",
     "Dynamics",
+    "Mass, Weight and Density",
     "Turning Effect of Forces",
     "Energy",
     "Kinetic Particle Model of Matter",
     "Thermal Processes",
+    "Thermal Properties of Matter",
     "General Wave Properties",
+    "Sound",
     "Electromagnetic Spectrum",
     "Light",
     "Electric Charge and Current of Electricity",
@@ -1380,6 +1442,73 @@ def _norm_topic(name):
         if rest:
             s = rest
     return s.strip().lower()
+
+
+def canonical_topic(name):
+    """Collapse the sheet's many inconsistent Topic spellings into ONE
+    canonical syllabus topic, so the picker and the quiz filter agree.
+
+    The Topic column mixes number prefixes ("1. Dynamics" vs "Dynamics"),
+    abbreviations ("DC Circuits" vs "D.C. Circuits") and aliases
+    ("Measurement", "Kinetic Model" ...). Without this, exact-match topic
+    filtering scatters questions across duplicate labels and quiz creation
+    finds too few (or zero) questions. Unrecognised topics pass through
+    cleaned (number prefix stripped) so nothing is silently dropped."""
+    raw = str(name or '').strip()
+    s = _norm_topic(raw)               # number-prefix stripped + lowercased
+    if not s:
+        return raw
+
+    def has(*subs):
+        return any(sub in s for sub in subs)
+
+    # Order matters: most specific checks first.
+    if has('physical quantit', 'units and measurement') or s in ('measurement', 'measurements'):
+        return "Physical Quantities, Units and Measurement"
+    if has('kinematic'):
+        return "Kinematics"
+    if (has('mass') and has('weight') and has('densit')) or s == 'density':
+        return "Mass, Weight and Density"
+    if has('turning effect', 'moment'):
+        return "Turning Effect of Forces"
+    if has('pressure'):
+        return "Pressure"
+    if has('kinetic') and has('particle', 'model'):
+        return "Kinetic Particle Model of Matter"
+    if has('thermal propert'):
+        return "Thermal Properties of Matter"
+    if has('thermal process', 'transfer of thermal', 'thermal transfer', 'thermal radiation') or s == 'temperature':
+        return "Thermal Processes"
+    if has('electromagnetic spectrum', 'em spectrum'):
+        return "Electromagnetic Spectrum"
+    if has('electromagnetic induction', 'em induction'):
+        return "Electromagnetic Induction"
+    if has('electromagnetism') or (has('magnetism') and has('electro')):
+        return "Electromagnetism"
+    if has('magnetism'):
+        return "Magnetism"
+    if has('static electric', 'electrostatic'):
+        return "Static Electricity"
+    if has('practical electric'):
+        return "Practical Electricity"
+    if 'circuit' in s and ('d.c' in s or 'dc ' in s or s.endswith('dc') or 'd c' in s):
+        return "D.C. Circuits"
+    if (has('current') and has('electric')) or 'current electricity' in s:
+        return "Current of Electricity"
+    if has('light'):
+        return "Light"
+    if s == 'sound':
+        return "Sound"
+    if has('wave'):
+        return "General Properties of Waves"
+    if has('radioactiv', 'nuclear'):
+        return "Radioactivity"
+    if has('energy') or (has('work') and has('power')):
+        return "Energy"
+    if has('dynamic') or s in ('force', 'forces'):
+        return "Dynamics"
+    # Unknown: return number-prefix-stripped original (Title-preserving).
+    return raw.lstrip('0123456789').lstrip('.) ').strip() or raw
 
 
 def _topic_sort_key(name, order):
@@ -1410,15 +1539,14 @@ async def get_subtopics(level: str = None):
         if cat in ('pure', 'nonpure', 'non-pure', 'combined'):
             want_nonpure = cat != 'pure'
             order = COMBINED_TOPIC_ORDER if want_nonpure else PURE_TOPIC_ORDER
-            # Surface the full syllabus list, in order. Where a topic has
-            # questions, use the exact name from the sheet so quiz generation
-            # matches; where it has none, fall back to the canonical name.
-            by_norm = {}
-            for q in cache.questions:
-                if (q.subtopic and q.subtopic.lower() != 'question setup'
-                        and _is_nonpure(q.level) == want_nonpure):
-                    by_norm.setdefault(_norm_topic(q.subtopic), q.subtopic)
-            subtopics = [by_norm.get(_norm_topic(c), c) for c in order]
+            # q.subtopic is already canonicalised at load time, so just return
+            # the distinct canonical topics that actually have questions at
+            # this level, ordered by the syllabus sequence. This guarantees
+            # the picker's names exactly match what quiz generation filters on.
+            present = {q.subtopic for q in cache.questions
+                       if q.subtopic and q.subtopic.lower() != 'question setup'
+                       and _is_nonpure(q.level) == want_nonpure}
+            subtopics = sorted(present, key=lambda s: _topic_sort_key(s, order))
         else:
             subtopics = sorted(cache.get_unique_subtopics(),
                                key=lambda s: _topic_sort_key(s, PURE_TOPIC_ORDER))
@@ -3537,11 +3665,12 @@ async def get_user_ranks(authorization: str = Header(None)):
             conn2 = get_db_connection()
             cursor2 = conn2.cursor()
             try:
-                cursor2.execute("SELECT xp, gems, daily_goal FROM users WHERE id = %s", (user_id,))
+                cursor2.execute("SELECT xp, gems, daily_goal, equipped FROM users WHERE id = %s", (user_id,))
                 _xr = cursor2.fetchone()
                 _xp   = int(_xr[0]) if _xr and _xr[0] is not None else 0
                 _gems = int(_xr[1]) if _xr and _xr[1] is not None else 0
                 _goal = int(_xr[2]) if _xr and _xr[2] is not None else 10
+                _equipped = _parse_equipped(_xr[3] if _xr and len(_xr) > 3 else None)
                 # Freeze count: 1 if no streak row yet (everyone starts with
                 # the free weekly freeze, matching /api/streak's default).
                 cursor2.execute("SELECT freezes_available FROM streaks WHERE user_id = %s", (user_id,))
@@ -3551,7 +3680,7 @@ async def get_user_ranks(authorization: str = Header(None)):
                 cursor2.close()
                 conn2.close()
         except Exception:
-            _xp, _gems, _goal, _freezes = 0, 0, 10, 1
+            _xp, _gems, _goal, _freezes, _equipped = 0, 0, 10, 1, {}
 
         return {
             "ranks":             ranks,
@@ -3561,6 +3690,7 @@ async def get_user_ranks(authorization: str = Header(None)):
             "daily_goal":        _goal,
             "freezes_available": _freezes,
             "freeze_cap":        GEMS_FREEZE_CAP,
+            "equipped":          _equipped,
         }
     except HTTPException:
         raise
@@ -4614,6 +4744,32 @@ SHOP_CATALOGUE = [
     {"id": "legs_ballet",  "slot": "legs",      "rarity": "epic",      "name": "Ballet Slippers","cost": 1200, "emoji": "🩰", "desc": "On your toes."},
     {"id": "legs_skate",   "slot": "legs",      "rarity": "epic",      "name": "Skateboard",     "cost": 1100, "emoji": "🛹", "desc": "Roll into class."},
     {"id": "legs_rocket",  "slot": "legs",      "rarity": "legendary", "name": "Rocket Boots",   "cost": 2800, "emoji": "🚀", "desc": "Blast off — physics demands it."},
+
+    # ── Skin tones (the base monkey's fur colour) ─────────────────────
+    # slot "skin" is the BASE layer — free to switch between, like Duolingo
+    # letting you pick your character's look. All cost 0 (equippable without
+    # an ownership row). Paid wearables above layer on top of any skin tone.
+    {"id": "skin_default",  "slot": "skin", "rarity": "common", "name": "Classic Brown", "cost": 0, "emoji": "🐵", "desc": "The original Ooka."},
+    {"id": "skin_tan",      "slot": "skin", "rarity": "common", "name": "Tan",           "cost": 0, "emoji": "🐵", "desc": "A lighter, warmer coat."},
+    {"id": "skin_espresso", "slot": "skin", "rarity": "common", "name": "Espresso",      "cost": 0, "emoji": "🐵", "desc": "Deep, rich dark brown."},
+    {"id": "skin_grey",     "slot": "skin", "rarity": "common", "name": "Silver",        "cost": 0, "emoji": "🐵", "desc": "Cool silver-grey fur."},
+    {"id": "skin_golden",   "slot": "skin", "rarity": "common", "name": "Golden",        "cost": 0, "emoji": "🐵", "desc": "Sunny golden monkey."},
+    {"id": "skin_cream",    "slot": "skin", "rarity": "common", "name": "Cream",         "cost": 0, "emoji": "🐵", "desc": "Soft pale cream."},
+
+    # ── Outfits (full-body clothing worn over any skin tone) ───────────
+    # slot "outfit" renders as a PNG layered on the monkey's torso/arms.
+    # Free for now (cost 0) so it shows in the currently free-only shop.
+    {"id": "hoodie_navy",   "slot": "outfit", "rarity": "rare", "name": "Ooka Hoodie", "cost": 0, "emoji": "🧥", "desc": "The classic navy Ooka hoodie."},
+
+    # ── Wearables (metadata-placed SVGs; free so they show in the shop) ──
+    {"id": "cap_ooka",      "slot": "hat",       "rarity": "common", "name": "Ooka Cap",    "cost": 0, "emoji": "🧢", "desc": "Navy cap with the gold O."},
+    {"id": "shades",        "slot": "glasses",   "rarity": "common", "name": "Cool Shades", "cost": 0, "emoji": "🕶️", "desc": "Too cool for school."},
+    {"id": "crown_gold",    "slot": "hat",       "rarity": "rare",   "name": "Gold Crown",  "cost": 0, "emoji": "👑", "desc": "Rule the leaderboard."},
+    {"id": "scarf_red",     "slot": "accessory", "rarity": "common", "name": "Cozy Scarf",  "cost": 0, "emoji": "🧣", "desc": "Warm and stylish."},
+    {"id": "beanie_teal",   "slot": "hat",       "rarity": "common", "name": "Cozy Beanie", "cost": 0, "emoji": "🧶", "desc": "Knit and toasty."},
+    {"id": "glasses_round", "slot": "glasses",   "rarity": "common", "name": "Round Specs",  "cost": 0, "emoji": "🤓", "desc": "Smart and studious."},
+    {"id": "bowtie_red",    "slot": "accessory", "rarity": "common", "name": "Red Bowtie",   "cost": 0, "emoji": "🎀", "desc": "Dapper and sharp."},
+    {"id": "cape_red",      "slot": "backItem",  "rarity": "rare",   "name": "Hero Cape",    "cost": 0, "emoji": "🦸", "desc": "Save the leaderboard."},
 ]
 SHOP_BY_ID = {item["id"]: item for item in SHOP_CATALOGUE}
 
@@ -4649,7 +4805,9 @@ def _account_age_days(user_id):
 
 import json as _json
 
-_WEARABLE_SLOTS = {"hat", "glasses", "accessory", "frame", "hands", "legs"}
+# "skin" is the base-character slot (the monkey's fur tone); "outfit" is a
+# full-body clothing layer (PNG); the rest are overlay wearables on top.
+_WEARABLE_SLOTS = {"skin", "outfit", "hat", "glasses", "accessory", "frame", "hands", "legs", "backItem"}
 
 
 def _parse_equipped(raw):
@@ -4700,12 +4858,16 @@ async def equip_reward(request: ShopEquipRequest, authorization: str = Header(No
         cursor = conn.cursor()
         try:
             if request.reward_id:
-                cursor.execute(
-                    "SELECT 1 FROM user_rewards WHERE user_id = %s AND reward_id = %s",
-                    (user_id, request.reward_id),
-                )
-                if not cursor.fetchone():
-                    raise HTTPException(status_code=400, detail="You do not own this item")
+                # Free items (cost 0 — e.g. the default Classic Ooka avatar)
+                # are equippable by everyone without an ownership row.
+                item = SHOP_BY_ID.get(request.reward_id)
+                if item and int(item.get("cost", 0)) > 0:
+                    cursor.execute(
+                        "SELECT 1 FROM user_rewards WHERE user_id = %s AND reward_id = %s",
+                        (user_id, request.reward_id),
+                    )
+                    if not cursor.fetchone():
+                        raise HTTPException(status_code=400, detail="You do not own this item")
 
             cursor.execute("SELECT equipped FROM users WHERE id = %s", (user_id,))
             row = cursor.fetchone()
@@ -4763,11 +4925,16 @@ async def get_shop(authorization: str = Header(None)):
             conn.close()
 
         age_days, shop_unlocked, days_until_unlock = _account_age_days(user_id)
+        # Only surface free items (skin tones) — buyable wearables are
+        # currently hidden from the shop. Item definitions stay in
+        # SHOP_CATALOGUE so already-equipped items still render and so the
+        # paid catalogue can be re-enabled by removing this filter.
+        visible_catalogue = [it for it in SHOP_CATALOGUE if int(it.get("cost", 0)) == 0]
         return {
             "gems":                 gems,
             "owned":                owned,
             "equipped":             equipped,
-            "catalogue":            SHOP_CATALOGUE,
+            "catalogue":            visible_catalogue,
             "account_age_days":     age_days,
             "shop_unlocked":        shop_unlocked,
             "days_until_unlock":    days_until_unlock,
