@@ -888,32 +888,42 @@ class QuestionCache:
             print(f"📁 Pre-loading file map from Google Drive (recursive) — roots: {QUESTION_FOLDER_IDS}")
             files = []
             seen_folders = set()
-            queue = list(QUESTION_FOLDER_IDS)   # breadth-first folder walk
-            while queue:
-                folder_id = queue.pop(0)
-                if not folder_id or folder_id in seen_folders:
-                    continue
-                seen_folders.add(folder_id)
-                page_token = None
-                while True:
-                    results = drive_service.files().list(
-                        q=f"'{folder_id}' in parents and trashed=false",
-                        spaces='drive',
-                        fields='nextPageToken, files(id, name, mimeType)',
-                        pageSize=1000,
-                        pageToken=page_token,
-                        # Work for both My Drive and Shared Drives.
-                        includeItemsFromAllDrives=True,
-                        supportsAllDrives=True,
-                    ).execute()
-                    for f in results.get('files', []):
-                        if f.get('mimeType') == FOLDER_MIME:
-                            queue.append(f['id'])        # descend into subfolder
-                        else:
-                            files.append(f)
-                    page_token = results.get('nextPageToken')
-                    if not page_token:
-                        break
+            # Walk each root independently so a permission error on one drive
+            # (e.g. not shared with the service account) doesn't wipe the whole
+            # map. Per-root counts are logged so you can see what each scanned.
+            for root in QUESTION_FOLDER_IDS:
+                root_count = 0
+                queue = [root]
+                while queue:
+                    folder_id = queue.pop(0)
+                    if not folder_id or folder_id in seen_folders:
+                        continue
+                    seen_folders.add(folder_id)
+                    page_token = None
+                    try:
+                        while True:
+                            results = drive_service.files().list(
+                                q=f"'{folder_id}' in parents and trashed=false",
+                                spaces='drive',
+                                fields='nextPageToken, files(id, name, mimeType)',
+                                pageSize=1000,
+                                pageToken=page_token,
+                                includeItemsFromAllDrives=True,
+                                supportsAllDrives=True,
+                            ).execute()
+                            for f in results.get('files', []):
+                                if f.get('mimeType') == FOLDER_MIME:
+                                    queue.append(f['id'])    # descend into subfolder
+                                else:
+                                    files.append(f)
+                                    root_count += 1
+                            page_token = results.get('nextPageToken')
+                            if not page_token:
+                                break
+                    except Exception as fe:
+                        print(f"   ⚠️  Could not list folder {folder_id} (root {root}): {fe}")
+                        continue
+                print(f"   • root {root}: {root_count} image files")
 
             # Map name → file ID. setdefault = first occurrence wins, so a file
             # found in a shallower folder isn't clobbered by a same-named file
@@ -1110,7 +1120,7 @@ class QuestionCache:
                     question = Question(
                         uid=uid,
                         qno=qno,
-                        subtopic=canonical_topic(subtopic),
+                        subtopic=canonical_topic(subtopic, combined=_is_nonpure(level)),
                         difficulty=difficulty,
                         level=level,
                         subject=subject or 'Physics',
@@ -1138,6 +1148,29 @@ class QuestionCache:
         except Exception as e:
             print(f"❌ Error loading questions: {e}")
             raise
+
+    def _drive_search_id(self, uid):
+        """Last-resort resolver: search Drive by filename for `uid` (+ common
+        image extensions). Rescues images whose parent folder the scan can't
+        traverse (e.g. the file is shared with the service account but its drive
+        folder is not). Results get cached into file_map by the caller."""
+        if not drive_service or not uid:
+            return None
+        for nm in (uid + '.png', uid + '.jpg', uid + '.jpeg', uid):
+            safe = nm.replace('\\', '\\\\').replace("'", "\\'")
+            try:
+                r = drive_service.files().list(
+                    q=f"name = '{safe}' and trashed=false",
+                    fields='files(id, name)', pageSize=1,
+                    includeItemsFromAllDrives=True, supportsAllDrives=True,
+                ).execute()
+                fs = r.get('files', [])
+                if fs:
+                    print(f"      [drive_search] matched '{nm}' -> {fs[0]['id']}")
+                    return fs[0]['id']
+            except Exception as e:
+                print(f"      [drive_search] error for {nm}: {e}")
+        return None
 
     def resolve_file_id(self, potential_file_id: str) -> Optional[str]:
         """
@@ -1167,9 +1200,16 @@ class QuestionCache:
                     print(f"      [resolve_file_id] Found with extension {ext}: {result}")
                     return result
 
-        # If nothing found, assume it's already a file ID
-        # (might be one that doesn't exist in our folder)
-        print(f"      [resolve_file_id] Not found in map, assuming it's a file ID already")
+        # Not in the pre-scanned map — search Drive by name. This rescues
+        # images whose folder the scan can't traverse (parent not shared).
+        found = self._drive_search_id(potential_file_id)
+        if found:
+            self.file_map[potential_file_id] = found
+            self.file_map[potential_file_id.lower()] = found
+            return found
+
+        # Still nothing — assume the value is already a real file ID.
+        print(f"      [resolve_file_id] Not found in map or search; assuming it's a file ID")
         return potential_file_id
 
     def get_image_url(self, uid: str) -> Optional[str]:
@@ -1413,25 +1453,23 @@ PURE_TOPIC_ORDER = [
 ]
 
 COMBINED_TOPIC_ORDER = [
-    "Physical Quantities, Units and Measurements",
-    "Kinematics",
-    "Force and Pressure",
-    "Dynamics",
-    "Mass, Weight and Density",
-    "Turning Effect of Forces",
-    "Energy",
-    "Kinetic Particle Model of Matter",
-    "Thermal Processes",
-    "Thermal Properties of Matter",
-    "General Wave Properties",
-    "Sound",
-    "Electromagnetic Spectrum",
-    "Light",
-    "Electric Charge and Current of Electricity",
-    "D.C. Circuits",
-    "Practical Electricity",
-    "Magnetism and Electromagnetism",
-    "Radioactivity",
+    # SEAB 5086/87/88 official content structure — 16 topics, in order.
+    "Physical Quantities, Units and Measurement",   # 1
+    "Kinematics",                                    # 2
+    "Force and Pressure",                            # 3
+    "Dynamics",                                      # 4
+    "Turning Effect of Forces",                      # 5
+    "Energy",                                        # 6
+    "Kinetic Particle Model of Matter",              # 7
+    "Thermal Processes",                             # 8
+    "General Wave Properties",                       # 9
+    "Electromagnetic Spectrum",                      # 10
+    "Light",                                         # 11
+    "Electric Charge and Current of Electricity",    # 12
+    "D.C. Circuits",                                 # 13
+    "Practical Electricity",                         # 14
+    "Magnetism and Electromagnetism",                # 15
+    "Radioactivity",                                 # 16
 ]
 
 
@@ -1449,7 +1487,7 @@ def _norm_topic(name):
     return s.strip().lower()
 
 
-def canonical_topic(name):
+def _canonical_topic_base(name):
     """Collapse the sheet's many inconsistent Topic spellings into ONE
     canonical syllabus topic, so the picker and the quiz filter agree.
 
@@ -1514,6 +1552,31 @@ def canonical_topic(name):
         return "Dynamics"
     # Unknown: return number-prefix-stripped original (Title-preserving).
     return raw.lstrip('0123456789').lstrip('.) ').strip() or raw
+
+
+# Combined Sci Physics (5086/87/88) merges several Pure topics into one. Applied
+# AFTER the base canonical so the picker + filter use the official 16-topic set.
+_COMBINED_MERGE = {
+    "Static Electricity":           "Electric Charge and Current of Electricity",
+    "Current of Electricity":       "Electric Charge and Current of Electricity",
+    "Magnetism":                    "Magnetism and Electromagnetism",
+    "Electromagnetism":             "Magnetism and Electromagnetism",
+    "Electromagnetic Induction":    "Magnetism and Electromagnetism",
+    "Pressure":                     "Force and Pressure",
+    "Sound":                        "General Wave Properties",
+    "General Properties of Waves":  "General Wave Properties",
+    "Thermal Properties of Matter": "Thermal Processes",
+    "Mass, Weight and Density":     "Dynamics",
+}
+
+
+def canonical_topic(name, combined=False):
+    """Canonical syllabus topic. For Combined physics (`combined=True`) the
+    Pure-style topics are merged into the official 16-topic Combined set."""
+    base = _canonical_topic_base(name)
+    if combined:
+        return _COMBINED_MERGE.get(base, base)
+    return base
 
 
 def _topic_sort_key(name, order):
