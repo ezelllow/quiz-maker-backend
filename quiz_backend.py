@@ -42,8 +42,10 @@ QUESTION_FOLDER_ID = '10TtAVgxTsczSFxIrkwSSy_KFQlebWCiX'
 # QUESTION_FOLDER_IDS env var (comma-separated). Defaults to QUESTION_FOLDER_ID.
 _DEFAULT_QUESTION_FOLDER_IDS = ','.join([
     QUESTION_FOLDER_ID,                      # legacy flat folder (un-migrated papers)
-    '1c3e88WMHQ62uG1AZ4VDeK_d5tMwPwFqO',     # Pure Physics drive (per-paper subfolders)
-    '1IH-v6RCDsEnYm8oeJS7RaIhSicHhNFcC',     # Combined (4E5N) Physics drive (per-paper subfolders)
+    '1c3e88WMHQ62uG1AZ4VDeK_d5tMwPwFqO',     # pure_physics_p1            (Level "Pure Physics")
+    '1IH-v6RCDsEnYm8oeJS7RaIhSicHhNFcC',     # combined_physics_p1_G3     (Level "combinedG3")
+    '154YP-TOlk6gFgVS6e9Hegr60CE26OWDl',     # combined_physics_p1_G2     (Level "combinedG2")
+    '1RkICWBLlBpV0k87NZzRFTifpL-evTwDw',     # combined_physics_p1_G1     (Level "combinedG1")
 ])
 QUESTION_FOLDER_IDS = [
     fid.strip()
@@ -56,7 +58,7 @@ QUESTION_FOLDER_IDS = [
 # SHEET_NAME (singular) is still honoured for backward compatibility.
 SHEET_NAMES = [
     name.strip()
-    for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or '4E5N,Pure Physics').split(',')
+    for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or 'Pure Physics,combinedG1,combinedG2,combinedG3,4E5N').split(',')
     if name.strip()
 ]
 
@@ -1319,12 +1321,8 @@ class QuestionCache:
         # Filter by level. Accepts the 'pure' / 'nonpure' category keywords
         # (non-pure == the sheet's '4E5N') or an exact Level value.
         if level:
-            lv = str(level).strip().lower()
-            if lv in ('pure', 'nonpure', 'non-pure', 'combined'):
-                want_nonpure = lv != 'pure'
-                filtered = [q for q in filtered if _is_nonpure(q.level) == want_nonpure]
-            else:
-                filtered = [q for q in filtered if q.level and q.level.lower() == lv]
+            req_key = _level_key(level)
+            filtered = [q for q in filtered if _level_matches(req_key, q.level)]
 
         # Filter by subject (Physics, Math, ...)
         if subject:
@@ -1472,6 +1470,49 @@ COMBINED_TOPIC_ORDER = [
     "Radioactivity",                                 # 16
 ]
 
+COMBINED_G2_TOPIC_ORDER = [
+    # SEAB 5105/06/07 Normal (Academic) Science, Physics — 13 topics, in order.
+    # Note vs G3: no Turning Effect of Forces, no Light, no Magnetism/Electromag.
+    "Physical Quantities, Units and Measurement",   # 1
+    "Kinematics",                                    # 2
+    "Force and Pressure",                            # 3
+    "Dynamics",                                      # 4
+    "Energy",                                        # 5
+    "Kinetic Particle Model of Matter",              # 6
+    "Thermal Processes",                             # 7
+    "General Wave Properties",                       # 8
+    "Electromagnetic Spectrum",                      # 9
+    "Electric Charge and Current of Electricity",    # 10
+    "D.C. Circuits",                                 # 11
+    "Practical Electricity",                         # 12
+    "Radioactivity",                                 # 13
+]
+
+COMBINED_G1_TOPIC_ORDER = [
+    # SEAB 5148 Normal (Technical) Science — physics strand ("Machines Around
+    # Us (II)"), 4 topics, in order.
+    "Energy",                                        # 1
+    "Electricity",                                   # 2
+    "Wave",                                          # 3
+    "Effects of Force",                              # 4
+]
+
+# Map a level key to its official syllabus topic order.
+_LEVEL_TOPIC_ORDER = {
+    "pure":       PURE_TOPIC_ORDER,
+    "combined":   COMBINED_TOPIC_ORDER,
+    "combinedG3": COMBINED_TOPIC_ORDER,
+    "combinedG2": COMBINED_G2_TOPIC_ORDER,
+    "combinedG1": COMBINED_G1_TOPIC_ORDER,
+}
+
+def _order_for_level(req_key):
+    """Official syllabus topic order for a level key. Falls back to the full
+    Combined set for any unknown non-pure key."""
+    if req_key in _LEVEL_TOPIC_ORDER:
+        return _LEVEL_TOPIC_ORDER[req_key]
+    return PURE_TOPIC_ORDER if req_key == "pure" else COMBINED_TOPIC_ORDER
+
 
 def _norm_topic(name):
     """Normalise a topic name for matching: strip a leading number prefix
@@ -1532,7 +1573,7 @@ def _canonical_topic_base(name):
         return "Magnetism"
     if has('static electric', 'electrostatic'):
         return "Static Electricity"
-    if has('practical electric'):
+    if has('practical electric') or (has('safe') and has('electric')):
         return "Practical Electricity"
     if 'circuit' in s and ('d.c' in s or 'dc ' in s or s.endswith('dc') or 'd c' in s):
         return "D.C. Circuits"
@@ -1590,9 +1631,44 @@ def _topic_sort_key(name, order):
 
 
 def _is_nonpure(level_value):
-    """Non-pure physics is labelled '4E5N' in the sheet's Level column.
-    Everything else counts as pure physics."""
-    return '4e5n' in str(level_value or '').strip().lower()
+    """Combined Science Physics. The sheet's Level column now tags combined
+    questions as combinedG1 / combinedG2 / combinedG3 (was '4E5N'); Pure
+    Physics is tagged 'Pure Physics'. Combined == anything that isn't Pure."""
+    s = str(level_value or '').strip().lower()
+    return ('combined' in s) or ('4e5n' in s) or ('nonpure' in s) or ('non-pure' in s)
+
+
+def _level_key(value):
+    """Canonical subject/level key for a Level string (request param OR sheet
+    cell): 'pure', 'combinedG1', 'combinedG2', 'combinedG3', or generic
+    'combined' (all tiers). Handles 'Pure Physics', 'combinedG3', legacy
+    '4E5N' / 'nonpure'."""
+    s = str(value or '').strip().lower().replace(' ', '').replace('-', '').replace('_', '')
+    if 'combinedg1' in s or s == 'g1':
+        return 'combinedG1'
+    if 'combinedg2' in s or s == 'g2':
+        return 'combinedG2'
+    if 'combinedg3' in s or s == 'g3':
+        return 'combinedG3'
+    if 'pure' in s:
+        return 'pure'
+    if 'combined' in s or '4e5n' in s or 'nonpure' in s:
+        return 'combined'
+    return s
+
+
+def _level_matches(req_key, q_level):
+    """Does a question's Level satisfy a requested level key? A specific tier
+    (combinedG1/2/3, pure) matches only that tier; the generic 'combined'
+    matches any combined tier."""
+    if req_key in (None, '', 'all'):
+        return True
+    qk = _level_key(q_level)
+    if req_key == 'pure':
+        return qk == 'pure'
+    if req_key == 'combined':
+        return qk != 'pure'
+    return qk == req_key
 
 
 @app.get("/api/subtopics", response_model=List[str])
@@ -1604,16 +1680,19 @@ async def get_subtopics(level: str = None):
             cache.load_questions()
 
         cat = (level or '').strip().lower()
-        if cat in ('pure', 'nonpure', 'non-pure', 'combined'):
-            want_nonpure = cat != 'pure'
-            order = COMBINED_TOPIC_ORDER if want_nonpure else PURE_TOPIC_ORDER
-            # q.subtopic is already canonicalised at load time, so just return
-            # the distinct canonical topics that actually have questions at
-            # this level, ordered by the syllabus sequence. This guarantees
-            # the picker's names exactly match what quiz generation filters on.
+        if cat:
+            req_key = _level_key(level)
+            order = _order_for_level(req_key)
+            order_norms = {_norm_topic(c) for c in order}
+            # q.subtopic is already canonicalised at load time. Return the
+            # distinct canonical topics that (a) have questions at this level
+            # and (b) belong to this level's official syllabus, ordered by the
+            # syllabus sequence. The syllabus restriction keeps each subject
+            # accurate (e.g. Normal-Academic G2 won't show O-Level-only topics).
             present = {q.subtopic for q in cache.questions
                        if q.subtopic and q.subtopic.lower() != 'question setup'
-                       and _is_nonpure(q.level) == want_nonpure}
+                       and _level_matches(req_key, q.level)
+                       and _norm_topic(q.subtopic) in order_norms}
             subtopics = sorted(present, key=lambda s: _topic_sort_key(s, order))
         else:
             subtopics = sorted(cache.get_unique_subtopics(),
@@ -1636,14 +1715,16 @@ async def get_availability(level: str = None):
             cache.load_questions()
 
         cat = (level or '').strip().lower()
-        level_known = cat in ('pure', 'nonpure', 'non-pure', 'combined')
-        want_nonpure = (cat != 'pure') if level_known else None
+        req_key = _level_key(level) if cat else None
+        order_norms = {_norm_topic(c) for c in _order_for_level(req_key)} if req_key else None
 
         avail = {}
         for q in cache.questions:
             if not q.subtopic or q.subtopic.lower() == 'question setup':
                 continue
-            if want_nonpure is not None and _is_nonpure(q.level) != want_nonpure:
+            if req_key is not None and not _level_matches(req_key, q.level):
+                continue
+            if order_norms is not None and _norm_topic(q.subtopic) not in order_norms:
                 continue
             dk = str(q.difficulty or '').strip().lower()
             if dk.startswith('eas'):
@@ -1798,12 +1879,10 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
             # "All topics" (no specific pick): restrict the pool to the chosen
             # level's syllabus topics so irrelevant topics never leak in.
             if not single_topic and request.level:
-                _lv = str(request.level).strip().lower()
-                if _lv in ('pure', 'nonpure', 'non-pure', 'combined'):
-                    _order = COMBINED_TOPIC_ORDER if _lv != 'pure' else PURE_TOPIC_ORDER
-                    _norms = {_norm_topic(c) for c in _order}
-                    filtered_questions = [q for q in filtered_questions
-                                          if _norm_topic(q.subtopic) in _norms]
+                _key = _level_key(request.level)
+                _norms = {_norm_topic(c) for c in _order_for_level(_key)}
+                filtered_questions = [q for q in filtered_questions
+                                      if _norm_topic(q.subtopic) in _norms]
             if not filtered_questions:
                 raise HTTPException(
                     status_code=400,
