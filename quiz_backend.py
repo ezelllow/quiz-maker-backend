@@ -6,6 +6,7 @@ Returns filtered quizzes based on difficulty, subtopic, and count
 
 import os
 import random
+import re
 from typing import List, Optional, Tuple, Dict
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Header
@@ -1122,7 +1123,7 @@ class QuestionCache:
                     question = Question(
                         uid=uid,
                         qno=qno,
-                        subtopic=canonical_topic(subtopic, combined=_is_nonpure(level)),
+                        subtopic=canonical_topic(subtopic, combined=_is_nonpure(level), level_key=_level_key(level)),
                         difficulty=difficulty,
                         level=level,
                         subject=subject or 'Physics',
@@ -1489,12 +1490,21 @@ COMBINED_G2_TOPIC_ORDER = [
 ]
 
 COMBINED_G1_TOPIC_ORDER = [
-    # SEAB 5148 Normal (Technical) Science — physics strand ("Machines Around
-    # Us (II)"), 4 topics, in order.
+    # SEAB 5148 Normal (Technical) Science — full syllabus, 11 topics, in order.
+    # I. Machines Around Us (Physics)
     "Energy",                                        # 1
     "Electricity",                                   # 2
     "Wave",                                          # 3
     "Effects of Force",                              # 4
+    # II. Food Matters (Chemistry)
+    "Sources of Food",                               # 5
+    "Food Chemistry",                                # 6
+    "Food Safety",                                   # 7
+    # III. Our Body and Health (Biology)
+    "Staying Healthy",                               # 8
+    "Digestion",                                     # 9
+    "Breathing",                                     # 10
+    "Blood Circulation",                             # 11
 ]
 
 # Map a level key to its official syllabus topic order.
@@ -1516,15 +1526,9 @@ def _order_for_level(req_key):
 
 def _norm_topic(name):
     """Normalise a topic name for matching: strip a leading number prefix
-    (e.g. "2. Kinematics"), lowercase, trim."""
+    (e.g. "2. Kinematics", "1.4 Effects of Force", "3) Wave"), lowercase, trim."""
     s = str(name).strip()
-    i = 0
-    while i < len(s) and s[i].isdigit():
-        i += 1
-    if i > 0:
-        rest = s[i:].lstrip(".) ")
-        if rest:
-            s = rest
+    s = re.sub(r'^\d+(?:\.\d+)*[.\)\s:]*', '', s)
     return s.strip().lower()
 
 
@@ -1592,7 +1596,7 @@ def _canonical_topic_base(name):
     if has('dynamic') or s in ('force', 'forces'):
         return "Dynamics"
     # Unknown: return number-prefix-stripped original (Title-preserving).
-    return raw.lstrip('0123456789').lstrip('.) ').strip() or raw
+    return re.sub(r'^\d+(?:\.\d+)*[.\)\s:]*', '', raw).strip() or raw
 
 
 # Combined Sci Physics (5086/87/88) merges several Pure topics into one. Applied
@@ -1611,10 +1615,47 @@ _COMBINED_MERGE = {
 }
 
 
-def canonical_topic(name, combined=False):
+# Normal (Technical) 5148 physics buckets the granular O-Level topics into the
+# 4 coarse 5148 topics (Energy / Electricity / Wave / Effects of Force), since
+# the G1 question bank is tagged with O-Level topic names.
+_NT_BUCKET = {
+    "Energy": "Energy",
+    "Kinetic Particle Model of Matter": "Energy",
+    "Thermal Processes": "Energy",
+    "Thermal Properties of Matter": "Energy",
+    "Static Electricity": "Electricity",
+    "Current of Electricity": "Electricity",
+    "Electric Charge and Current of Electricity": "Electricity",
+    "D.C. Circuits": "Electricity",
+    "Practical Electricity": "Electricity",
+    "Magnetism": "Electricity",
+    "Electromagnetism": "Electricity",
+    "Electromagnetic Induction": "Electricity",
+    "Magnetism and Electromagnetism": "Electricity",
+    "General Properties of Waves": "Wave",
+    "General Wave Properties": "Wave",
+    "Sound": "Wave",
+    "Light": "Wave",
+    "Electromagnetic Spectrum": "Wave",
+    "Physical Quantities, Units and Measurement": "Effects of Force",
+    "Kinematics": "Effects of Force",
+    "Dynamics": "Effects of Force",
+    "Turning Effect of Forces": "Effects of Force",
+    "Pressure": "Effects of Force",
+    "Force and Pressure": "Effects of Force",
+    "Mass, Weight and Density": "Effects of Force",
+}
+
+
+def canonical_topic(name, combined=False, level_key=None):
     """Canonical syllabus topic. For Combined physics (`combined=True`) the
-    Pure-style topics are merged into the official 16-topic Combined set."""
+    Pure-style topics are merged into the official 16-topic Combined set. For
+    Normal-Technical G1 (`level_key='combinedG1'`) the granular topics are
+    further bucketed into the 4 coarse 5148 topics."""
     base = _canonical_topic_base(name)
+    if level_key == 'combinedG1':
+        merged = _COMBINED_MERGE.get(base, base)
+        return _NT_BUCKET.get(base) or _NT_BUCKET.get(merged) or merged
     if combined:
         return _COMBINED_MERGE.get(base, base)
     return base
@@ -1682,18 +1723,11 @@ async def get_subtopics(level: str = None):
         cat = (level or '').strip().lower()
         if cat:
             req_key = _level_key(level)
-            order = _order_for_level(req_key)
-            order_norms = {_norm_topic(c) for c in order}
-            # q.subtopic is already canonicalised at load time. Return the
-            # distinct canonical topics that (a) have questions at this level
-            # and (b) belong to this level's official syllabus, ordered by the
-            # syllabus sequence. The syllabus restriction keeps each subject
-            # accurate (e.g. Normal-Academic G2 won't show O-Level-only topics).
-            present = {q.subtopic for q in cache.questions
-                       if q.subtopic and q.subtopic.lower() != 'question setup'
-                       and _level_matches(req_key, q.level)
-                       and _norm_topic(q.subtopic) in order_norms}
-            subtopics = sorted(present, key=lambda s: _topic_sort_key(s, order))
+            # Return the FULL official syllabus topic list for this level, in
+            # order, so the picker always mirrors the syllabus even when a topic
+            # has no questions yet. The frontend disables the empty ones using
+            # /api/availability.
+            subtopics = list(_order_for_level(req_key))
         else:
             subtopics = sorted(cache.get_unique_subtopics(),
                                key=lambda s: _topic_sort_key(s, PURE_TOPIC_ORDER))
@@ -2110,20 +2144,37 @@ async def serve_image(file_id: str):
                     resolved_id = hits[0][1]
                     print(f"  🔍 [serve_image] '{file_id}' → '{resolved_id}' via prefix '{hits[0][0]}' ({len(hits)} candidates)")
 
-        # Download file from Google Drive
-        request = drive_service.files().get_media(fileId=resolved_id)
-        downloader = request.execute()
-        if isinstance(downloader, bytes):
-            data = downloader
-        else:
-            # If it's a stream, read it
+        # Download file from Google Drive. If the resolved value still isn't a
+        # fetchable ID (e.g. the URL carried a filename that the scan never put
+        # in file_map, or a stale ID), fall back to a Drive name-search by the
+        # ORIGINAL request value and retry once. This makes the endpoint
+        # self-healing for un-scanned per-paper folders.
+        def _fetch(fid):
+            dl = drive_service.files().get_media(fileId=fid).execute()
+            if isinstance(dl, bytes):
+                return dl
             buf = BytesIO()
             while True:
-                chunk = downloader.read(8192)
+                chunk = dl.read(8192)
                 if not chunk:
                     break
                 buf.write(chunk)
-            data = buf.getvalue()
+            return buf.getvalue()
+
+        try:
+            data = _fetch(resolved_id)
+        except Exception:
+            searched = cache._drive_search_id(file_id)
+            if not searched and resolved_id != file_id:
+                searched = cache._drive_search_id(resolved_id)
+            if searched and searched != resolved_id:
+                print(f"  🔁 [serve_image] '{file_id}' fetch failed; drive-search → {searched}")
+                cache.file_map[file_id] = searched
+                cache.file_map[file_id.lower()] = searched
+                resolved_id = searched
+                data = _fetch(resolved_id)
+            else:
+                raise
 
         # Store in the cache under BOTH the original URL key and the
         # resolved Drive ID so subsequent requests with either form hit
