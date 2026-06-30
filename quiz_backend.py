@@ -1963,7 +1963,10 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
             # Always set setup_image_url if diagram exists (for frontend fallback)
             if question.diagram_file_id:
                 # Resolve potential filename to actual Google Drive file ID
-                actual_file_id = cache.resolve_file_id(question.diagram_file_id)
+                # NOTE: store the raw filename/UID in the image URL (not a
+                # resolved Drive ID) so serve_image resolves it fresh each request
+                # — survives image re-uploads that change the Drive file ID.
+                actual_file_id = question.diagram_file_id
                 if actual_file_id:
                     # Use backend image proxy endpoint
                     question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
@@ -1980,7 +1983,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                 if question.options_image_uid:
                     print(f"  IMAGE type → Searching for options image: {question.options_image_uid}")
                     # Resolve options image UID to file ID
-                    options_file_id = cache.resolve_file_id(question.options_image_uid)
+                    options_file_id = question.options_image_uid
                     if options_file_id:
                         # Use backend image proxy endpoint
                         question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
@@ -3127,12 +3130,12 @@ async def get_attempt_details(attempt_id: int, authorization: str = Header(None)
             # Resolve diagram / options image file IDs to URLs
             for q in questions_data:
                 if q.get('diagram_file_id'):
-                    actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                    actual_file_id = q['diagram_file_id']
                     if actual_file_id:
                         q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
 
                 if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
-                    options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                    options_file_id = q['options_image_uid']
                     if options_file_id:
                         q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
                 elif q.get('setup_image_url') and not q.get('image_url'):
@@ -3256,12 +3259,12 @@ async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)
             # Set image URLs for questions
             for q in questions_data:
                 if q.get('diagram_file_id'):
-                    actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                    actual_file_id = q['diagram_file_id']
                     if actual_file_id:
                         q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
 
                 if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
-                    options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                    options_file_id = q['options_image_uid']
                     if options_file_id:
                         q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
                 elif q.get('setup_image_url'):
@@ -3735,7 +3738,7 @@ async def get_placement_questions(subject: str = "Physics", authorization: str =
 
             # Resolve the setup diagram (always, if one exists)
             if question.diagram_file_id:
-                actual_file_id = cache.resolve_file_id(question.diagram_file_id)
+                actual_file_id = question.diagram_file_id
                 if actual_file_id:
                     question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
 
@@ -3743,7 +3746,7 @@ async def get_placement_questions(subject: str = "Physics", authorization: str =
             # fall back to the setup diagram as the question's image_url.
             if question.option_type == "IMAGE":
                 if question.options_image_uid:
-                    options_file_id = cache.resolve_file_id(question.options_image_uid)
+                    options_file_id = question.options_image_uid
                     if options_file_id:
                         question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
             else:
@@ -4343,12 +4346,12 @@ async def get_daily_challenge(subject: str = "Physics", authorization: str = Hea
                 if not question.diagram_file_id and setup_info.get("file_id"):
                     question.diagram_file_id = setup_info["file_id"]
             if question.diagram_file_id:
-                actual_file_id = cache.resolve_file_id(question.diagram_file_id)
+                actual_file_id = question.diagram_file_id
                 if actual_file_id:
                     question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
             if question.option_type == "IMAGE":
                 if question.options_image_uid:
-                    options_file_id = cache.resolve_file_id(question.options_image_uid)
+                    options_file_id = question.options_image_uid
                     if options_file_id:
                         question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
             else:
@@ -5688,11 +5691,11 @@ async def get_teacher_attempt_detail(attempt_id: int, authorization: str = Heade
         # render directly (mirrors the retake endpoint).
         for q in questions_data:
             if q.get('diagram_file_id'):
-                actual_file_id = cache.resolve_file_id(q['diagram_file_id'])
+                actual_file_id = q['diagram_file_id']
                 if actual_file_id:
                     q['setup_image_url'] = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
             if q.get('option_type') == 'IMAGE' and q.get('options_image_uid'):
-                options_file_id = cache.resolve_file_id(q['options_image_uid'])
+                options_file_id = q['options_image_uid']
                 if options_file_id:
                     q['image_url'] = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
             elif q.get('setup_image_url') and not q.get('image_url'):
