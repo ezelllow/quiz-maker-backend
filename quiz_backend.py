@@ -187,6 +187,9 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     name: str
+    school: Optional[str] = None
+    student_class: Optional[str] = None
+    teacher: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: str
@@ -539,6 +542,21 @@ def init_database():
         if cursor.fetchone()[0] == 0:
             cursor.execute("ALTER TABLE users ADD COLUMN equipped JSON NULL AFTER avatar_url")
             print("🔧 Added equipped column to users")
+
+        # School / class / teacher — collected on the signup form.
+        for _col, _ddl in (
+            ('school',        "ALTER TABLE users ADD COLUMN school VARCHAR(255) NULL"),
+            ('student_class', "ALTER TABLE users ADD COLUMN student_class VARCHAR(255) NULL"),
+            ('teacher',       "ALTER TABLE users ADD COLUMN teacher VARCHAR(255) NULL"),
+        ):
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'users' AND COLUMN_NAME = %s
+            """, (_col,))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(_ddl)
+                print(f"🔧 Added {_col} column to users")
 
         # XP column (Phase 3 leaderboard). Backfill in the same conditional so
         # we only compute legacy XP exactly once per database.
@@ -2234,8 +2252,8 @@ async def signup(request: SignupRequest):
 
             # Insert new user
             cursor.execute(
-                "INSERT INTO users (email, password_hash, name) VALUES (%s, %s, %s)",
-                (request.email, password_hash, request.name)
+                "INSERT INTO users (email, password_hash, name, school, student_class, teacher) VALUES (%s, %s, %s, %s, %s, %s)",
+                (request.email, password_hash, request.name, request.school, request.student_class, request.teacher)
             )
             conn.commit()
 
@@ -2262,6 +2280,9 @@ async def signup(request: SignupRequest):
                     'level':      compute_level(0),
                     'rank':       compute_rank(0),
                     'is_teacher': False,
+                    'school':        request.school,
+                    'student_class': request.student_class,
+                    'teacher':       request.teacher,
                 }
             )
 
