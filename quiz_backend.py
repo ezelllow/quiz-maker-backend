@@ -195,6 +195,11 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class CompleteProfileRequest(BaseModel):
+    school: str
+    student_class: str
+    teacher: str
+
 class GoogleLoginRequest(BaseModel):
     token: str  # Google ID token from frontend
 
@@ -2310,7 +2315,7 @@ async def login(request: LoginRequest):
         try:
             # Find user by email
             cursor.execute(
-                "SELECT id, email, password_hash, name, avatar_url, xp, gems, daily_goal, is_teacher FROM users WHERE email = %s",
+                "SELECT id, email, password_hash, name, avatar_url, xp, gems, daily_goal, is_teacher, school, student_class, teacher FROM users WHERE email = %s",
                 (request.email,)
             )
             user = cursor.fetchone()
@@ -2318,7 +2323,7 @@ async def login(request: LoginRequest):
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
-            user_id, email, password_hash, name, avatar_url, user_xp, user_gems, user_daily_goal, user_is_teacher = user
+            user_id, email, password_hash, name, avatar_url, user_xp, user_gems, user_daily_goal, user_is_teacher, u_school, u_class, u_teacher = user
 
             # Verify password
             if not verify_password(request.password, password_hash):
@@ -2345,6 +2350,9 @@ async def login(request: LoginRequest):
                     'level':      compute_level(user_xp or 0),
                     'rank':       compute_rank(user_xp or 0),
                     'is_teacher': bool(user_is_teacher),
+                    'school':        u_school,
+                    'student_class': u_class,
+                    'teacher':       u_teacher,
                 }
             )
 
@@ -2425,9 +2433,12 @@ async def google_login(request: GoogleLoginRequest):
 
             # Fetch is_teacher once so the existing-user, linked-user, and
             # brand-new-user branches above all converge on the same value.
-            cursor.execute("SELECT is_teacher FROM users WHERE id = %s", (user_id,))
+            cursor.execute("SELECT is_teacher, school, student_class, teacher FROM users WHERE id = %s", (user_id,))
             _row = cursor.fetchone()
             google_is_teacher = bool(_row[0]) if _row else False
+            g_school  = _row[1] if _row else None
+            g_class   = _row[2] if _row else None
+            g_teacher = _row[3] if _row else None
 
             # Create JWT token
             token = create_jwt_token(user_id, email, google_is_teacher)
@@ -2447,6 +2458,9 @@ async def google_login(request: GoogleLoginRequest):
                     'level':      compute_level(google_xp or 0),
                     'rank':       compute_rank(google_xp or 0),
                     'is_teacher': google_is_teacher,
+                    'school':        g_school,
+                    'student_class': g_class,
+                    'teacher':       g_teacher,
                 }
             )
 
@@ -2485,7 +2499,7 @@ async def get_user_profile(authorization: str = Header(None)):
 
         try:
             cursor.execute(
-                "SELECT id, email, name, avatar_url, created_at, is_teacher, equipped FROM users WHERE id = %s",
+                "SELECT id, email, name, avatar_url, created_at, is_teacher, equipped, school, student_class, teacher FROM users WHERE id = %s",
                 (user_id,)
             )
             user = cursor.fetchone()
@@ -2494,7 +2508,7 @@ async def get_user_profile(authorization: str = Header(None)):
                 raise HTTPException(status_code=404, detail="User not found")
 
             (user_id, user_email, user_name, user_avatar, created_at,
-             user_is_teacher, user_equipped) = user
+             user_is_teacher, user_equipped, me_school, me_class, me_teacher) = user
 
             return {
                 'success': True,
@@ -2510,6 +2524,9 @@ async def get_user_profile(authorization: str = Header(None)):
                     # Settings, etc.) can render the avatar with hat /
                     # glasses / hands / legs / accessory / frame.
                     'equipped': _parse_equipped(user_equipped),
+                    'school':        me_school,
+                    'student_class': me_class,
+                    'teacher':       me_teacher,
                 }
             }
 
@@ -2522,6 +2539,38 @@ async def get_user_profile(authorization: str = Header(None)):
     except Exception as e:
         print(f"❌ Error getting user profile: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.post("/api/auth/complete-profile")
+async def complete_profile(request: CompleteProfileRequest, authorization: str = Header(None)):
+    """Set the signed-in user's school / class / teacher. Powers the
+    'complete your profile' gate for Google signups and legacy accounts that
+    were created before these fields existed."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="No authorization token")
+    payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    school        = (request.school or '').strip()
+    student_class = (request.student_class or '').strip()
+    teacher       = (request.teacher or '').strip()
+    if not school or not student_class or not teacher:
+        raise HTTPException(status_code=400, detail="School, class and teacher are all required")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE users SET school = %s, student_class = %s, teacher = %s WHERE id = %s",
+            (school, student_class, teacher, payload.get('user_id'))
+        )
+        conn.commit()
+        print(f"✅ Profile completed for user {payload.get('email')}: {school} / {student_class} / {teacher}")
+        return {'success': True, 'school': school, 'student_class': student_class, 'teacher': teacher}
+    finally:
+        cursor.close()
+        conn.close()
 
 
 class ProfileUpdateRequest(BaseModel):
