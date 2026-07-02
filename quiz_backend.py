@@ -8,7 +8,8 @@ import os
 import random
 import re
 from typing import List, Optional, Tuple, Dict
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+import threading
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
@@ -134,12 +135,38 @@ def get_credentials():
 
 try:
     credentials = get_credentials()
-    sheets_service = build('sheets', 'v4', credentials=credentials)
-    drive_service = build('drive', 'v3', credentials=credentials)
 except Exception as e:
     print(f"⚠️  Warning: Could not initialize Google APIs: {e}")
-    sheets_service = None
-    drive_service = None
+    credentials = None
+
+# googleapiclient (httplib2 transport) is NOT thread-safe when one service
+# object is shared across threads. Route handlers are plain `def` now (they
+# run in FastAPI's threadpool for real concurrency), so each thread builds
+# its own service lazily and reuses it. Discovery docs are cached in-process
+# so per-thread build() costs no extra network round-trips.
+class _DiscoveryCache:
+    _docs = {}
+    def get(self, url):
+        return self._docs.get(url)
+    def set(self, url, content):
+        self._docs[url] = content
+
+_thread_services = threading.local()
+
+def _thread_service(kind, name, version):
+    if credentials is None:
+        return None
+    svc = getattr(_thread_services, kind, None)
+    if svc is None:
+        svc = build(name, version, credentials=credentials, cache=_DiscoveryCache())
+        setattr(_thread_services, kind, svc)
+    return svc
+
+def get_sheets_service():
+    return _thread_service('sheets', 'sheets', 'v4')
+
+def get_drive_service():
+    return _thread_service('drive', 'drive', 'v3')
 
 # ============================================================================
 # DATA MODELS
@@ -885,6 +912,9 @@ class QuestionCache:
         self.image_url_cache = {}
         self.setup_info_map = {}  # Maps question UID to {'text': ..., 'file_id': ...}
         self.file_map = {}  # Pre-loaded file mapping by name (for faster lookup)
+        # Serializes load_questions/load_file_map — with threadpool handlers
+        # two threads could otherwise parse/scan simultaneously.
+        self._load_lock = threading.Lock()
 
     def load_file_map(self, force=False):
         """Pre-load every image under QUESTION_FOLDER_IDS into memory for lookup.
@@ -901,7 +931,11 @@ class QuestionCache:
         Pass force=True to re-scan even if file_map is already populated
         (useful after uploading new images while the server is running).
         """
-        if not drive_service:
+        with self._load_lock:
+            return self._load_file_map_unlocked(force)
+
+    def _load_file_map_unlocked(self, force=False):
+        if not get_drive_service():
             return
         if self.file_map and not force:
             return  # Already loaded
@@ -928,7 +962,7 @@ class QuestionCache:
                     page_token = None
                     try:
                         while True:
-                            results = drive_service.files().list(
+                            results = get_drive_service().files().list(
                                 q=f"'{folder_id}' in parents and trashed=false",
                                 spaces='drive',
                                 fields='nextPageToken, files(id, name, mimeType)',
@@ -1017,17 +1051,25 @@ class QuestionCache:
 
     def load_questions(self):
         """Load all questions from Google Sheet and cache them"""
-        if self.is_loaded:
-            return
+        with self._load_lock:
+            if self.is_loaded:
+                return
+            return self._load_questions_unlocked()
 
-        if not sheets_service:
+    def _load_questions_unlocked(self):
+        # Reset before (re)parsing — a failed earlier attempt must not leave
+        # partial rows for a retry to append onto (duplicated question bank).
+        self.questions = []
+        self.setup_info_map = {}
+
+        if not get_sheets_service():
             raise RuntimeError("Google Sheets API not initialized")
 
         try:
             # The workbook now holds questions across multiple tabs (Pure +
             # 4E5N). One batchGet fetches them all in a single API call; each
             # tab is its own valueRange in the response.
-            batch = sheets_service.spreadsheets().values().batchGet(
+            batch = get_sheets_service().spreadsheets().values().batchGet(
                 spreadsheetId=SPREADSHEET_ID,
                 ranges=SHEET_NAMES,
             ).execute()
@@ -1180,12 +1222,12 @@ class QuestionCache:
         image extensions). Rescues images whose parent folder the scan can't
         traverse (e.g. the file is shared with the service account but its drive
         folder is not). Results get cached into file_map by the caller."""
-        if not drive_service or not uid:
+        if not get_drive_service() or not uid:
             return None
         for nm in (uid + '.png', uid + '.jpg', uid + '.jpeg', uid):
             safe = nm.replace('\\', '\\\\').replace("'", "\\'")
             try:
-                r = drive_service.files().list(
+                r = get_drive_service().files().list(
                     q=f"name = '{safe}' and trashed=false",
                     fields='files(id, name)', pageSize=1,
                     includeItemsFromAllDrives=True, supportsAllDrives=True,
@@ -1207,8 +1249,6 @@ class QuestionCache:
         if not potential_file_id:
             return None
 
-        print(f"      [resolve_file_id] Input: {potential_file_id}")
-        print(f"      [resolve_file_id] File map size: {len(self.file_map)}")
 
         # If it looks like a real Google Drive file ID (contains hyphen/underscore, mostly alphanumeric)
         # and exists in file_map as a key, it's a file ID
@@ -1218,12 +1258,10 @@ class QuestionCache:
         for base in [potential_file_id, potential_file_id.lower()]:
             if base in self.file_map:
                 result = self.file_map[base]
-                print(f"      [resolve_file_id] Found match: {result}")
                 return result
             for ext in ['.png', '.jpg', '.jpeg', '.gif']:
                 if base + ext in self.file_map:
                     result = self.file_map[base + ext]
-                    print(f"      [resolve_file_id] Found with extension {ext}: {result}")
                     return result
 
         # Not in the pre-scanned map — search Drive by name. This rescues
@@ -1235,7 +1273,6 @@ class QuestionCache:
             return found
 
         # Still nothing — assume the value is already a real file ID.
-        print(f"      [resolve_file_id] Not found in map or search; assuming it's a file ID")
         return potential_file_id
 
     def get_image_url(self, uid: str) -> Optional[str]:
@@ -1243,7 +1280,7 @@ class QuestionCache:
         if uid in self.image_url_cache:
             return self.image_url_cache[uid]
 
-        if not drive_service or not self.file_map:
+        if not get_drive_service() or not self.file_map:
             return None
 
         try:
@@ -1444,7 +1481,7 @@ app.add_middleware(
 # ============================================================================
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint"""
     return {"status": "ok", "questions_loaded": cache.is_loaded}
 
@@ -1736,7 +1773,7 @@ def _level_matches(req_key, q_level):
 
 
 @app.get("/api/subtopics", response_model=List[str])
-async def get_subtopics(level: str = None):
+def get_subtopics(level: str = None):
     """Available topics, optionally filtered to one physics level.
     `level` = 'pure' or 'nonpure' (non-pure == the sheet's '4E5N' Level)."""
     try:
@@ -1762,7 +1799,7 @@ async def get_subtopics(level: str = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/availability")
-async def get_availability(level: str = None):
+def get_availability(level: str = None):
     """Per-topic difficulty availability for the build form. Returns
     {topic: {"easy": N, "medium": N, "hard": N}} -- the question count per
     topic per difficulty at the chosen level. Lets the frontend grey out a
@@ -1803,7 +1840,7 @@ async def get_availability(level: str = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/difficulties", response_model=List[str])
-async def get_difficulties():
+def get_difficulties():
     """Get all available difficulty levels"""
     try:
         print(f"📌 /api/difficulties called. Cache loaded: {cache.is_loaded}, Questions count: {len(cache.questions)}")
@@ -1821,7 +1858,7 @@ async def get_difficulties():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/levels", response_model=List[str])
-async def get_levels():
+def get_levels():
     """Get all available levels (streams/subjects)"""
     try:
         print(f"📌 /api/levels called. Cache loaded: {cache.is_loaded}, Questions count: {len(cache.questions)}")
@@ -1839,7 +1876,7 @@ async def get_levels():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/quiz", response_model=QuizResponse)
-async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
+def create_quiz(request: QuizRequest, authorization: str = Header(None)):
     """
     Create a quiz based on filters (requires authentication)
 
@@ -1957,31 +1994,25 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
         selected_questions = [deepcopy(q) for q in selected_questions]
 
         # Attach setup information and set image URLs for each question
-        print(f"\nDEBUG: Processing {len(selected_questions)} selected questions")
-        print(f"DEBUG: setup_info_map keys: {list(cache.setup_info_map.keys())}")
 
         for question in selected_questions:
-            print(f"\nDEBUG: Processing question: {question.uid}")
 
             # Try to find setup info (check with and without trailing dash)
             setup_uid = question.uid.rstrip('-')  # Remove trailing dash if present
             setup_info = cache.setup_info_map.get(setup_uid)
 
             if setup_info:
-                print(f"  ✅ Found setup info for {setup_uid}")
                 # Prepend setup text to question text
                 if setup_info['text']:
                     question.question_text = setup_info['text'] + "\n\n" + question.question_text
-                    print(f"  ✅ Added setup text")
                 else:
-                    print(f"  ⚠️  Setup info has no text")
+                    pass
 
             # Use setup diagram if question doesn't have its own
             if not question.diagram_file_id and setup_info and setup_info.get('file_id'):
                 question.diagram_file_id = setup_info['file_id']
-                print(f"  ✅ Using setup diagram from setup row: {setup_info['file_id']}")
             elif not question.diagram_file_id:
-                print(f"  ℹ️  No diagram available")
+                pass
 
             # Always set setup_image_url if diagram exists (for frontend fallback)
             if question.diagram_file_id:
@@ -1993,9 +2024,8 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                 if actual_file_id:
                     # Use backend image proxy endpoint
                     question.setup_image_url = f"{PUBLIC_BASE_URL}/api/image/{actual_file_id}"
-                    print(f"  ✅ Setup diagram available (resolved to {actual_file_id[:20]}...)")
                 else:
-                    print(f"  ⚠️  Could not resolve diagram file ID: {question.diagram_file_id}")
+                    pass
 
             # Set image_url based on question type:
             # - For IMAGE type: ONLY use options image (if it exists)
@@ -2004,22 +2034,19 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
             if question.option_type == 'IMAGE':
                 # IMAGE type: only show options image if available
                 if question.options_image_uid:
-                    print(f"  IMAGE type → Searching for options image: {question.options_image_uid}")
                     # Resolve options image UID to file ID
                     options_file_id = question.options_image_uid
                     if options_file_id:
                         # Use backend image proxy endpoint
                         question.image_url = f"{PUBLIC_BASE_URL}/api/image/{options_file_id}"
-                        print(f"  ✅ Options image found (resolved to {options_file_id[:20]}...)")
                     else:
-                        print(f"  ⚠️  Options image not found - will show setup diagram instead")
+                        pass
                 else:
-                    print(f"  ⚠️  IMAGE type but no options_image_uid - will use setup diagram")
+                    pass
             else:
                 # Non-IMAGE type (TEXT, TABLE): use setup diagram for image_url
                 if question.setup_image_url:
                     question.image_url = question.setup_image_url
-                    print(f"  ✅ Setup diagram set as image_url")
 
         return QuizResponse(
             questions=selected_questions,
@@ -2036,7 +2063,7 @@ async def create_quiz(request: QuizRequest, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/questions/by-category")
-async def get_questions_by_category():
+def get_questions_by_category():
     """
     Get all questions organized by type (TEXT, TABLE, IMAGE)
     Useful for Claude Code to extract questions by category
@@ -2049,7 +2076,7 @@ async def get_questions_by_category():
 
 
 @app.get("/api/questions/type/{qtype}")
-async def get_questions_by_type_endpoint(qtype: str):
+def get_questions_by_type_endpoint(qtype: str):
     """
     Get questions of a specific type (TEXT, TABLE, or IMAGE)
     Example: /api/questions/type/TABLE
@@ -2074,7 +2101,7 @@ async def get_questions_by_type_endpoint(qtype: str):
 
 
 @app.get("/api/statistics/categories")
-async def get_category_statistics_endpoint():
+def get_category_statistics_endpoint():
     """
     Get statistics on question categories
     Returns: count, percentage, breakdown by difficulty and subtopic
@@ -2087,7 +2114,7 @@ async def get_category_statistics_endpoint():
 
 
 @app.get("/api/export/questions-by-category")
-async def export_questions_by_category():
+def export_questions_by_category():
     """
     Export all questions organized by category
     Returns data suitable for external processing
@@ -2109,12 +2136,45 @@ async def export_questions_by_category():
 # bytes we keep them in memory and never round-trip to Drive again. The
 # response also tells the browser to cache them forever (immutable), so a
 # returning user re-loads images straight from disk cache.
-_IMAGE_CACHE = {}
-_IMAGE_CACHE_MAX = 300
+# LRU image cache bounded by BYTES (was: 300 entries with no size budget —
+# 300 × ~1 MB scans could OOM a 512 MB instance). Lock because handlers now
+# run in a threadpool.
+_IMAGE_CACHE = OrderedDict()
+_IMAGE_CACHE_MAX_BYTES = 80 * 1024 * 1024
+_IMAGE_CACHE_BYTES = [0]
+_IMAGE_CACHE_LOCK = threading.Lock()
 _IMAGE_HEADERS = {
     "Cache-Control": "public, max-age=31536000, immutable",
     "Content-Disposition": "inline; filename=image.png",
 }
+
+def _image_cache_get(key):
+    with _IMAGE_CACHE_LOCK:
+        data = _IMAGE_CACHE.get(key)
+        if data is not None:
+            _IMAGE_CACHE.move_to_end(key)  # LRU touch
+        return data
+
+def _image_cache_put(key, data):
+    with _IMAGE_CACHE_LOCK:
+        if key in _IMAGE_CACHE:
+            _IMAGE_CACHE_BYTES[0] -= len(_IMAGE_CACHE[key])
+        _IMAGE_CACHE[key] = data
+        _IMAGE_CACHE.move_to_end(key)
+        _IMAGE_CACHE_BYTES[0] += len(data)
+        while _IMAGE_CACHE_BYTES[0] > _IMAGE_CACHE_MAX_BYTES and len(_IMAGE_CACHE) > 1:
+            _, evicted = _IMAGE_CACHE.popitem(last=False)
+            _IMAGE_CACHE_BYTES[0] -= len(evicted)
+
+def _sniff_media_type(data: bytes) -> str:
+    """Correct Content-Type from magic bytes (was hardcoded image/png)."""
+    if data[:3] == b'\xff\xd8\xff':
+        return 'image/jpeg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'image/gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    return 'image/png'
 
 
 # NOTE: {file_id:path} (not plain {file_id}) — question/paper names like
@@ -2124,7 +2184,7 @@ _IMAGE_HEADERS = {
 # The :path converter lets the param swallow slashes. Uvicorn decodes %2F
 # before routing, so encoding on the URL-building side would NOT fix this.
 @app.get("/api/image/{file_id:path}")
-async def serve_image(file_id: str):
+def serve_image(file_id: str):
     """
     Backend image proxy endpoint.
     Serves Google Drive images, cached in memory after the first fetch.
@@ -2137,11 +2197,11 @@ async def serve_image(file_id: str):
     """
     try:
         # Fast path — already in the in-memory cache.
-        cached = _IMAGE_CACHE.get(file_id)
+        cached = _image_cache_get(file_id)
         if cached is not None:
-            return Response(content=cached, media_type="image/png", headers=_IMAGE_HEADERS)
+            return Response(content=cached, media_type=_sniff_media_type(cached), headers=_IMAGE_HEADERS)
 
-        if not drive_service:
+        if not get_drive_service():
             raise HTTPException(status_code=500, detail="Google Drive service not initialized")
 
         # ── Resolve filename → Drive ID via the pre-loaded file_map ──
@@ -2182,7 +2242,7 @@ async def serve_image(file_id: str):
         # ORIGINAL request value and retry once. This makes the endpoint
         # self-healing for un-scanned per-paper folders.
         def _fetch(fid):
-            dl = drive_service.files().get_media(fileId=fid).execute()
+            dl = get_drive_service().files().get_media(fileId=fid).execute()
             if isinstance(dl, bytes):
                 return dl
             buf = BytesIO()
@@ -2211,16 +2271,11 @@ async def serve_image(file_id: str):
         # Store in the cache under BOTH the original URL key and the
         # resolved Drive ID so subsequent requests with either form hit
         # the fast path.
-        if len(_IMAGE_CACHE) >= _IMAGE_CACHE_MAX:
-            try:
-                _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
-            except StopIteration:
-                pass
-        _IMAGE_CACHE[file_id] = data
+        _image_cache_put(file_id, data)
         if resolved_id != file_id:
-            _IMAGE_CACHE[resolved_id] = data
+            _image_cache_put(resolved_id, data)
 
-        return Response(content=data, media_type="image/png", headers=_IMAGE_HEADERS)
+        return Response(content=data, media_type=_sniff_media_type(data), headers=_IMAGE_HEADERS)
 
     except HTTPException:
         raise
@@ -2236,7 +2291,7 @@ async def serve_image(file_id: str):
 # ============================================================================
 
 @app.post("/api/auth/signup", response_model=AuthResponse)
-async def signup(request: SignupRequest):
+def signup(request: SignupRequest):
     """Register a new user with email and password"""
     try:
         # Validate input
@@ -2309,7 +2364,7 @@ async def signup(request: SignupRequest):
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
-async def login(request: LoginRequest):
+def login(request: LoginRequest):
     """Login with email and password"""
     try:
         if not request.email or not request.password:
@@ -2374,7 +2429,7 @@ async def login(request: LoginRequest):
 
 
 @app.post("/api/auth/google", response_model=AuthResponse)
-async def google_login(request: GoogleLoginRequest):
+def google_login(request: GoogleLoginRequest):
     """Login or register with Google OAuth token"""
     try:
         if not GOOGLE_CLIENT_ID:
@@ -2482,7 +2537,7 @@ async def google_login(request: GoogleLoginRequest):
 
 
 @app.get("/api/auth/me")
-async def get_user_profile(authorization: str = Header(None)):
+def get_user_profile(authorization: str = Header(None)):
     """Get current user profile (requires token in Authorization header)"""
     try:
         # Get token from header
@@ -2548,7 +2603,7 @@ async def get_user_profile(authorization: str = Header(None)):
 
 
 @app.post("/api/auth/complete-profile")
-async def complete_profile(request: CompleteProfileRequest, authorization: str = Header(None)):
+def complete_profile(request: CompleteProfileRequest, authorization: str = Header(None)):
     """Set the signed-in user's school / class / teacher. Powers the
     'complete your profile' gate for Google signups and legacy accounts that
     were created before these fields existed."""
@@ -2586,7 +2641,7 @@ class ProfileUpdateRequest(BaseModel):
 
 
 @app.put("/api/auth/profile")
-async def update_user_profile(request: ProfileUpdateRequest, authorization: str = Header(None)):
+def update_user_profile(request: ProfileUpdateRequest, authorization: str = Header(None)):
     """Update the current user's display name and avatar."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -2662,7 +2717,7 @@ async def update_user_profile(request: ProfileUpdateRequest, authorization: str 
 # ============================================================================
 
 @app.post("/api/quiz/submit")
-async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Header(None)):
+def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Header(None)):
     """Submit a completed quiz and save to history"""
     try:
         # Verify authentication
@@ -3007,7 +3062,7 @@ async def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str
 
 
 @app.get("/api/history")
-async def get_quiz_history(
+def get_quiz_history(
     authorization: str = Header(None),
     saved_only: bool = False,
 ):
@@ -3126,7 +3181,7 @@ async def get_quiz_history(
 
 
 @app.get("/api/history/{attempt_id}")
-async def get_attempt_details(attempt_id: int, authorization: str = Header(None)):
+def get_attempt_details(attempt_id: int, authorization: str = Header(None)):
     """Get detailed review of a specific quiz attempt (shows wrong answers)"""
     try:
         # Verify authentication
@@ -3249,7 +3304,7 @@ async def get_attempt_details(attempt_id: int, authorization: str = Header(None)
 
 
 @app.get("/api/history/{attempt_id}/quiz")
-async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)):
+def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)):
     """Get the full quiz questions from a previous attempt for retaking"""
     try:
         # Verify authentication
@@ -3374,7 +3429,7 @@ async def get_quiz_for_retake(attempt_id: int, authorization: str = Header(None)
 
 
 @app.get("/api/stats")
-async def get_user_stats(authorization: str = Header(None)):
+def get_user_stats(authorization: str = Header(None)):
     """Aggregated statistics for the current user: overall accuracy,
     performance trend, per-subtopic + per-difficulty breakdown,
     weakest topics."""
@@ -3746,7 +3801,7 @@ def score_to_band(percentage: float) -> str:
 
 
 @app.get("/api/subjects", response_model=List[str])
-async def get_subjects():
+def get_subjects():
     """All subjects present in the question bank (defaults to [\'Physics\'])."""
     try:
         if not cache.is_loaded:
@@ -3758,7 +3813,7 @@ async def get_subjects():
 
 
 @app.get("/api/placement/questions")
-async def get_placement_questions(subject: str = "Physics", authorization: str = Header(None)):
+def get_placement_questions(subject: str = "Physics", authorization: str = Header(None)):
     """Return 15 placement questions for a subject, spread across topics and difficulty."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -3844,7 +3899,7 @@ class PlacementSubmitRequest(BaseModel):
 
 
 @app.post("/api/placement/submit")
-async def submit_placement(request: PlacementSubmitRequest, authorization: str = Header(None)):
+def submit_placement(request: PlacementSubmitRequest, authorization: str = Header(None)):
     """Score a placement quiz, compute the F9-A1 band, store it as the starting rank."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -3895,7 +3950,7 @@ async def submit_placement(request: PlacementSubmitRequest, authorization: str =
 
 
 @app.get("/api/ranks")
-async def get_user_ranks(authorization: str = Header(None)):
+def get_user_ranks(authorization: str = Header(None)):
     """Return the current user\'s rank per subject."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -4365,7 +4420,7 @@ def get_user_topic_accuracy(user_id: int) -> dict:
 
 
 @app.get("/api/daily-challenge")
-async def get_daily_challenge(subject: str = "Physics", authorization: str = Header(None)):
+def get_daily_challenge(subject: str = "Physics", authorization: str = Header(None)):
     """Today's Daily Challenge: DAILY_CHALLENGE_LEN questions, weak-topic weighted."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -4513,7 +4568,7 @@ class DailyChallengeSubmitRequest(BaseModel):
 
 
 @app.post("/api/daily-challenge/submit")
-async def submit_daily_challenge(request: DailyChallengeSubmitRequest, authorization: str = Header(None)):
+def submit_daily_challenge(request: DailyChallengeSubmitRequest, authorization: str = Header(None)):
     """Score a Daily Challenge: record it, update the streak, move rank if warranted."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -4696,7 +4751,7 @@ async def submit_daily_challenge(request: DailyChallengeSubmitRequest, authoriza
 
 
 @app.get("/api/streak")
-async def get_streak(authorization: str = Header(None)):
+def get_streak(authorization: str = Header(None)):
     """Current streak status. Lazily expires a dead streak so the display is honest."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -4750,7 +4805,7 @@ async def get_streak(authorization: str = Header(None)):
 
 
 @app.get("/api/streak/week")
-async def get_streak_week(authorization: str = Header(None)):
+def get_streak_week(authorization: str = Header(None)):
     """This week's per-day streak status (Mon -> Sun in SG time).
     Returns 7 day cells each with status: completed / freeze_used / today / missed / upcoming.
     Drives the Home page's weekly strip."""
@@ -4843,7 +4898,7 @@ async def get_streak_week(authorization: str = Header(None)):
 
 
 @app.get("/api/leaderboard")
-async def get_leaderboard(
+def get_leaderboard(
     authorization: str = Header(None),
     period: str = "weekly",
     limit: int  = 50,
@@ -4877,33 +4932,37 @@ async def get_leaderboard(
         cursor = conn.cursor()
         try:
             if period == "alltime":
+                # Skinny query — avatar_url is a LONGTEXT data-URL (up to
+                # 1.5 MB per user); selecting it for EVERY user shipped the
+                # whole student body's avatar images on each leaderboard view.
+                # Avatars are attached below, only for the returned slice.
                 cursor.execute("""
-                    SELECT id, name, avatar_url, equipped, COALESCE(xp, 0) AS score
+                    SELECT id, name, equipped, COALESCE(xp, 0) AS score
                     FROM users
                     WHERE name IS NOT NULL AND name <> ''
                     ORDER BY score DESC, id ASC
                 """)
             elif period == "daily":
                 cursor.execute("""
-                    SELECT u.id, u.name, u.avatar_url, u.equipped,
+                    SELECT u.id, u.name, u.equipped,
                            COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id AND dc.challenge_date = %s
                     WHERE u.name IS NOT NULL AND u.name <> ''
-                    GROUP BY u.id, u.name, u.avatar_url, u.equipped
+                    GROUP BY u.id, u.name, u.equipped
                     ORDER BY score DESC, u.id ASC
                 """, (today,))
             else:  # weekly
                 cursor.execute("""
-                    SELECT u.id, u.name, u.avatar_url, u.equipped,
+                    SELECT u.id, u.name, u.equipped,
                            COALESCE(SUM(dc.xp), 0) AS score
                     FROM users u
                     LEFT JOIN daily_challenges dc
                       ON dc.user_id = u.id
                      AND dc.challenge_date BETWEEN %s AND %s
                     WHERE u.name IS NOT NULL AND u.name <> ''
-                    GROUP BY u.id, u.name, u.avatar_url, u.equipped
+                    GROUP BY u.id, u.name, u.equipped
                     ORDER BY score DESC, u.id ASC
                 """, (monday, sunday))
 
@@ -4917,7 +4976,7 @@ async def get_leaderboard(
         full = []
         prev_score = None
         prev_rank  = 0
-        for idx, (uid, name, avatar_url, equipped_raw, score) in enumerate(rows, start=1):
+        for idx, (uid, name, equipped_raw, score) in enumerate(rows, start=1):
             score = int(score or 0)
             if prev_score is None or score != prev_score:
                 rank = idx
@@ -4930,7 +4989,7 @@ async def get_leaderboard(
             full.append({
                 "user_id":    int(uid),
                 "name":       name,
-                "avatar_url": avatar_url,
+                "avatar_url": None,  # attached below, only for the top slice
                 "equipped":   _parse_equipped(equipped_raw),
                 "score":      score,
                 "rank":       rank,
@@ -4944,6 +5003,25 @@ async def get_leaderboard(
             me = next((p for p in full if p["is_me"]), None)
             if me:
                 top.append(me)
+
+        # Attach avatars for just the rows we actually return (~20-50),
+        # not the whole table.
+        ids = [p["user_id"] for p in top]
+        if ids:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                marks = ",".join(["%s"] * len(ids))
+                cursor.execute(
+                    f"SELECT id, avatar_url FROM users WHERE id IN ({marks})",
+                    ids,
+                )
+                amap = {int(r[0]): r[1] for r in cursor.fetchall()}
+            finally:
+                cursor.close()
+                conn.close()
+            for p in top:
+                p["avatar_url"] = amap.get(p["user_id"])
 
         return {
             "period":     period,
@@ -5109,7 +5187,7 @@ class ShopEquipRequest(BaseModel):
 
 
 @app.post("/api/shop/equip")
-async def equip_reward(request: ShopEquipRequest, authorization: str = Header(None)):
+def equip_reward(request: ShopEquipRequest, authorization: str = Header(None)):
     """Equip / unequip a wearable. Two modes:
        • reward_id set → put in its slot (must own)
        • reward_id empty + slot set → clear that slot
@@ -5171,7 +5249,7 @@ async def equip_reward(request: ShopEquipRequest, authorization: str = Header(No
 
 
 @app.get("/api/shop")
-async def get_shop(authorization: str = Header(None)):
+def get_shop(authorization: str = Header(None)):
     """Return the shop catalogue + the user's gem balance + their owned reward IDs."""
     try:
         if not authorization or not authorization.startswith("Bearer "):
@@ -5229,7 +5307,7 @@ class ShopRedeemRequest(BaseModel):
 
 
 @app.post("/api/shop/redeem")
-async def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(None)):
+def redeem_reward(request: ShopRedeemRequest, authorization: str = Header(None)):
     """Spend gems to redeem one catalogue item. Idempotent-ish: UNIQUE constraint
     blocks double-redemption of the same item (returns 400 with a clear message)."""
     try:
@@ -5314,8 +5392,12 @@ async def startup_event():
         print("\U0001f680 Starting up...")
         print("\U0001f4be Initializing database...")
         init_database()
-        print("\U0001f4c1 Pre-loading file map...")
-        cache.load_file_map()
+        # Drive scan moved OFF the startup path — it recursively walks 4
+        # drives (one API call per folder) and was adding tens of seconds
+        # before the first request could be served. serve_image self-heals
+        # via file_map lookups + Drive name-search while the scan finishes.
+        print("\U0001f4c1 Pre-loading file map in background thread...")
+        threading.Thread(target=cache.load_file_map, daemon=True, name="drive-scan").start()
         print("\U0001f4cb Loading questions...")
         cache.load_questions()
         print(f"\U0001f4ca Available subtopics: {cache.get_unique_subtopics()}")
@@ -5338,7 +5420,7 @@ async def startup_event():
 # (UPDATE users SET is_teacher = TRUE WHERE email = ...).
 
 @app.get("/api/teacher/overview")
-async def get_teacher_overview(
+def get_teacher_overview(
     authorization: str = Header(None),
     quiz_type: Optional[str] = None,
 ):
@@ -5605,7 +5687,7 @@ async def get_teacher_overview(
 
 
 @app.get("/api/teacher/students/{user_id}")
-async def get_teacher_student_detail(user_id: int, authorization: str = Header(None)):
+def get_teacher_student_detail(user_id: int, authorization: str = Header(None)):
     """Single-student drill-in: card data + the last 50 attempts (summary only).
     Teachers click a student row in the dashboard to land here. Each attempt
     is a slim summary; click an attempt to fetch its full per-question detail
@@ -5693,7 +5775,7 @@ async def get_teacher_student_detail(user_id: int, authorization: str = Header(N
 
 
 @app.get("/api/teacher/attempts/{attempt_id}")
-async def get_teacher_attempt_detail(attempt_id: int, authorization: str = Header(None)):
+def get_teacher_attempt_detail(attempt_id: int, authorization: str = Header(None)):
     """Full per-question review for one attempt. Same shape as the student
     retake endpoint, but gated by is_teacher instead of attempt ownership."""
     require_teacher(authorization)
