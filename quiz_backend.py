@@ -2117,7 +2117,13 @@ _IMAGE_HEADERS = {
 }
 
 
-@app.get("/api/image/{file_id}")
+# NOTE: {file_id:path} (not plain {file_id}) — question/paper names like
+# "PHY-NASS2024-P1-Express/NA Combined-010-setup" contain a literal slash,
+# which a single-segment param can never match (the request 404s at the
+# router with FastAPI's generic "Not Found" before serve_image even runs).
+# The :path converter lets the param swallow slashes. Uvicorn decodes %2F
+# before routing, so encoding on the URL-building side would NOT fix this.
+@app.get("/api/image/{file_id:path}")
 async def serve_image(file_id: str):
     """
     Backend image proxy endpoint.
