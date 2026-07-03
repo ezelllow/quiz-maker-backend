@@ -12,3 +12,4 @@ PyJWT==2.12.1
 python-dotenv==1.0.0
 passlib==1.7.4
 bcrypt==4.1.1
+setuptools>=69
