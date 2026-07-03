@@ -60,7 +60,7 @@ QUESTION_FOLDER_IDS = [
 # SHEET_NAME (singular) is still honoured for backward compatibility.
 SHEET_NAMES = [
     name.strip()
-    for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or 'Pure Physics,combinedG1,combinedG2,combinedG3,4E5N').split(',')
+    for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or 'Pure Physics,combinedG1,combinedG2,combinedG3').split(',')
     if name.strip()
 ]
 
@@ -1066,14 +1066,31 @@ class QuestionCache:
             raise RuntimeError("Google Sheets API not initialized")
 
         try:
-            # The workbook now holds questions across multiple tabs (Pure +
-            # 4E5N). One batchGet fetches them all in a single API call; each
-            # tab is its own valueRange in the response.
-            batch = get_sheets_service().spreadsheets().values().batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=SHEET_NAMES,
-            ).execute()
-            value_ranges = batch.get('valueRanges', [])
+            # One batchGet fetches every tab in a single API call. BUT if any
+            # named tab is missing (deleted/renamed in the workbook), Sheets
+            # rejects the ENTIRE batch with 400 "Unable to parse range: <tab>"
+            # and the app can never load questions (every quiz endpoint 500s).
+            # So on batch failure, fall back to per-tab fetches and just skip
+            # tabs that don't exist.
+            svc = get_sheets_service()
+            fetched = []  # [(tab_name, valueRange), ...]
+            try:
+                batch = svc.spreadsheets().values().batchGet(
+                    spreadsheetId=SPREADSHEET_ID,
+                    ranges=SHEET_NAMES,
+                ).execute()
+                fetched = list(zip(SHEET_NAMES, batch.get('valueRanges', [])))
+            except Exception as batch_err:
+                print(f"⚠️  batchGet failed ({batch_err}); retrying tabs individually")
+                for tab in SHEET_NAMES:
+                    try:
+                        vr = svc.spreadsheets().values().get(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=tab,
+                        ).execute()
+                        fetched.append((tab, vr))
+                    except Exception as tab_err:
+                        print(f"⚠️  Skipping missing tab '{tab}': {tab_err}")
 
             # Merge all tabs into one rows list. The header row from the FIRST
             # non-empty tab wins; data rows from every tab are appended (their
@@ -1081,7 +1098,7 @@ class QuestionCache:
             rows = []
             headers = None
             per_tab_counts = []
-            for tab_name, vr in zip(SHEET_NAMES, value_ranges):
+            for tab_name, vr in fetched:
                 tab_rows = vr.get('values', [])
                 if not tab_rows:
                     per_tab_counts.append(f"{tab_name}: 0")
