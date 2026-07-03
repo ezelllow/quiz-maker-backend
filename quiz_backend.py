@@ -1721,7 +1721,25 @@ _NT_BUCKET = {
     "Pressure": "Effects of Force",
     "Force and Pressure": "Effects of Force",
     "Mass, Weight and Density": "Effects of Force",
+    # Chemistry / Biology (5148 II. Food Matters + III. Our Body and Health).
+    # Identity entries so sheet tags matching the official names — in ANY
+    # case, thanks to the lowercase fallback in canonical_topic — count
+    # toward the picker. Without these, chem/bio tags only matched on exact
+    # case and everything else fell through as an unknown topic ("Soon").
+    "Sources of Food": "Sources of Food",
+    "Food Chemistry": "Food Chemistry",
+    "Food Safety": "Food Safety",
+    "Staying Healthy": "Staying Healthy",
+    "Digestion": "Digestion",
+    "Breathing": "Breathing",
+    "Blood Circulation": "Blood Circulation",
+    # Common aliases seen in tagging
+    "Respiration": "Breathing",
+    "Respiratory System": "Breathing",
+    "Circulatory System": "Blood Circulation",
+    "Digestive System": "Digestion",
 }
+_NT_BUCKET_L = {k.lower(): v for k, v in _NT_BUCKET.items()}
 
 
 def canonical_topic(name, combined=False, level_key=None):
@@ -1732,7 +1750,9 @@ def canonical_topic(name, combined=False, level_key=None):
     base = _canonical_topic_base(name)
     if level_key == 'combinedG1':
         merged = _COMBINED_MERGE.get(base, base)
-        return _NT_BUCKET.get(base) or _NT_BUCKET.get(merged) or merged
+        return (_NT_BUCKET.get(base) or _NT_BUCKET.get(merged)
+                or _NT_BUCKET_L.get(base.lower()) or _NT_BUCKET_L.get(merged.lower())
+                or merged)
     if combined:
         return _COMBINED_MERGE.get(base, base)
     return base
