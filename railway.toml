@@ -1,0 +1,12 @@
+# Railway config-as-code — picked up automatically when the repo deploys.
+# Region (Southeast Asia — Singapore) is set on the service in the dashboard.
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "uvicorn quiz_backend:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 180
+restartPolicyType = "ON_FAILURE"
+# In-memory caches (question bank, image cache, Drive file map) assume ONE process.
+numReplicas = 1
