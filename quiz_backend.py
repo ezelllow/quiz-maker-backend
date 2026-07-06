@@ -1895,11 +1895,17 @@ def get_availability(level: str = None):
 
         cat = (level or '').strip().lower()
         req_key = _level_key(level) if cat else None
-        order_norms = {_norm_topic(c) for c in _order_for_level(req_key)} if req_key else None
+        order = _order_for_level(req_key) if req_key else None
+        # A level with an EMPTY official list (e.g. p6math) has no per-topic
+        # syllabus: report ALL its questions under one "All topics" bucket so
+        # the frontend can still grey out difficulties/counts it can't fill.
+        no_syllabus = req_key is not None and not order
+        order_norms = {_norm_topic(c) for c in order} if order else None
 
         avail = {}
         for q in cache.questions:
-            if not q.subtopic or q.subtopic.lower() == 'question setup':
+            topic_label = 'All topics' if no_syllabus else q.subtopic
+            if not no_syllabus and (not q.subtopic or q.subtopic.lower() == 'question setup'):
                 continue
             if req_key is not None and not _level_matches(req_key, q.level):
                 continue
@@ -1914,7 +1920,7 @@ def get_availability(level: str = None):
                 dk = 'hard'
             else:
                 continue
-            counts = avail.setdefault(q.subtopic, {'easy': 0, 'medium': 0, 'hard': 0})
+            counts = avail.setdefault(topic_label, {'easy': 0, 'medium': 0, 'hard': 0})
             counts[dk] += 1
 
         result = avail
