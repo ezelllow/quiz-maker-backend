@@ -36,6 +36,12 @@ load_dotenv()
 # ============================================================================
 
 SPREADSHEET_ID = '1TOmLo9UNpzOggeX27j1p6Q2NdAnCWpRJ1ErYAEJ-sZU'
+# P6 Math lives in its OWN spreadsheet (not a tab of the main workbook). Its
+# rows are appended to the question bank at load with Level FORCED to P6Math.
+P6_MATH_SPREADSHEET_ID = os.getenv('P6_MATH_SPREADSHEET_ID',
+                                   '1ND9K9_m8BlOBlXqUi5omqMiGqKstUB8mDnrmmGyRrAY')
+P6_MATH_LEVEL = 'P6Math'
+P6_MATH_TAB_LABEL = 'P6 Math [external]'
 QUESTION_FOLDER_ID = '10TtAVgxTsczSFxIrkwSSy_KFQlebWCiX'
 # Root Drive folder(s) scanned for question images. The scan is RECURSIVE, so
 # images resolve whether they sit directly in a folder (old flat layout) or in
@@ -48,6 +54,7 @@ _DEFAULT_QUESTION_FOLDER_IDS = ','.join([
     '1IH-v6RCDsEnYm8oeJS7RaIhSicHhNFcC',     # combined_physics_p1_G3     (Level "combinedG3")
     '154YP-TOlk6gFgVS6e9Hegr60CE26OWDl',     # combined_physics_p1_G2     (Level "combinedG2")
     '1RkICWBLlBpV0k87NZzRFTifpL-evTwDw',     # combined_physics_p1_G1     (Level "combinedG1")
+    '1o9w7cT6Ge1tn8RY2qKuAsG_-W_yvTVHF',     # p6_math                    (Level "P6Math")
 ])
 QUESTION_FOLDER_IDS = [
     fid.strip()
@@ -1092,6 +1099,19 @@ class QuestionCache:
                     except Exception as tab_err:
                         print(f"⚠️  Skipping missing tab '{tab}': {tab_err}")
 
+            # ── P6 Math: separate workbook, appended as one more source.
+            # Failure here must never take down the physics bank.
+            if P6_MATH_SPREADSHEET_ID:
+                try:
+                    vr = svc.spreadsheets().values().get(
+                        spreadsheetId=P6_MATH_SPREADSHEET_ID,
+                        range='A:ZZ',   # no tab name -> first sheet
+                    ).execute()
+                    if vr.get('values'):
+                        fetched.append((P6_MATH_TAB_LABEL, vr))
+                except Exception as p6_err:
+                    print(f"⚠️  Skipping P6 Math workbook: {p6_err}")
+
             # Merge all tabs into one rows list. The header row from the FIRST
             # non-empty tab wins; data rows from every tab are appended (their
             # own header rows are skipped).
@@ -1108,6 +1128,28 @@ class QuestionCache:
                 if headers is None:
                     headers = tab_header
                     rows.append(tab_header)
+                elif (tab_header != headers
+                      and all(h in tab_header for h in ('UID', 'Question', 'Options', 'Answer'))):
+                    # Same column NAMES but different positions/extras (e.g. the
+                    # external P6 workbook): remap each row to the first tab's
+                    # layout by header name instead of trusting positions.
+                    idx = {h: i for i, h in enumerate(tab_header)}
+                    tab_data = [
+                        [(r[idx[h]] if h in idx and idx[h] < len(r) else '') for h in headers]
+                        for r in tab_data
+                    ]
+                if tab_name == P6_MATH_TAB_LABEL and 'Level' in headers:
+                    # Force Level on every P6 row — filtering must not depend
+                    # on how rows happen to be tagged in that workbook.
+                    li = headers.index('Level')
+                    fixed = []
+                    for r in tab_data:
+                        r = list(r)
+                        while len(r) <= li:
+                            r.append('')
+                        r[li] = P6_MATH_LEVEL
+                        fixed.append(r)
+                    tab_data = fixed
                 # Append data rows. We deliberately do NOT enforce header
                 # equality across tabs; the column-index map below is built
                 # off the first tab's headers and the per-row width handling
@@ -1591,6 +1633,10 @@ _LEVEL_TOPIC_ORDER = {
     "combinedG3": COMBINED_TOPIC_ORDER,
     "combinedG2": COMBINED_G2_TOPIC_ORDER,
     "combinedG1": COMBINED_G1_TOPIC_ORDER,
+    # P6 Math: no per-topic syllabus yet — the picker offers only
+    # "All topics" (empty official list), and quiz creation with no topic
+    # selected filters purely by level.
+    "p6math":     [],
 }
 
 def _order_for_level(req_key):
@@ -1790,6 +1836,8 @@ def _level_key(value):
         return 'combinedG3'
     if 'pure' in s:
         return 'pure'
+    if ('p6' in s and 'math' in s) or s in ('p6', 'psle', 'pslemath'):
+        return 'p6math'
     if 'combined' in s or '4e5n' in s or 'nonpure' in s:
         return 'combined'
     return s
@@ -1805,7 +1853,7 @@ def _level_matches(req_key, q_level):
     if req_key == 'pure':
         return qk == 'pure'
     if req_key == 'combined':
-        return qk != 'pure'
+        return qk.startswith('combined')   # was: != 'pure' — must not swallow p6math etc.
     return qk == req_key
 
 
