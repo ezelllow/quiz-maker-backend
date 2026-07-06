@@ -2057,11 +2057,16 @@ def create_quiz(request: QuizRequest, authorization: str = Header(None)):
             )
             # "All topics" (no specific pick): restrict the pool to the chosen
             # level's syllabus topics so irrelevant topics never leak in.
+            # An EMPTY official list (e.g. p6math — no per-topic syllabus yet)
+            # means "no restriction": use the whole level pool, otherwise the
+            # empty set would filter out every question.
             if not single_topic and request.level:
                 _key = _level_key(request.level)
-                _norms = {_norm_topic(c) for c in _order_for_level(_key)}
-                filtered_questions = [q for q in filtered_questions
-                                      if _norm_topic(q.subtopic) in _norms]
+                _order = _order_for_level(_key)
+                if _order:
+                    _norms = {_norm_topic(c) for c in _order}
+                    filtered_questions = [q for q in filtered_questions
+                                          if _norm_topic(q.subtopic) in _norms]
             if not filtered_questions:
                 raise HTTPException(
                     status_code=400,
