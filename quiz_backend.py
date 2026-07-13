@@ -2083,7 +2083,41 @@ def create_quiz(request: QuizRequest, authorization: str = Header(None)):
                     status_code=400,
                     detail=f"Only {len(filtered_questions)} questions available, but {request.count} requested"
                 )
-            selected_questions = random.sample(filtered_questions, request.count)
+            if single_topic:
+                # One specific topic: plain random pick from its pool.
+                selected_questions = random.sample(filtered_questions, request.count)
+            else:
+                # "All topics - random mix": spread evenly across DISTINCT topics
+                # so an N-question quiz pulls from N different topics whenever the
+                # pool has at least N topics. With fewer than N topics, every topic
+                # is covered once before any repeats, and the remainder is spread as
+                # evenly as possible (round-robin, capacity-aware).
+                by_topic = {}
+                for _q in filtered_questions:
+                    _k = _norm_topic(_q.subtopic) if getattr(_q, "subtopic", None) else "mixed"
+                    by_topic.setdefault(_k, []).append(_q)
+                _keys = list(by_topic.keys())
+                _caps = {t: len(by_topic[t]) for t in _keys}
+                _alloc = {t: 0 for t in _keys}
+                _remaining = request.count  # guaranteed <= len(filtered_questions)
+                _order = _keys[:]
+                while _remaining > 0:
+                    random.shuffle(_order)
+                    _progressed = False
+                    for _t in _order:
+                        if _remaining == 0:
+                            break
+                        if _alloc[_t] < _caps[_t]:
+                            _alloc[_t] += 1
+                            _remaining -= 1
+                            _progressed = True
+                    if not _progressed:
+                        break
+                selected_questions = []
+                for _t, _n in _alloc.items():
+                    if _n:
+                        selected_questions.extend(random.sample(by_topic[_t], _n))
+                random.shuffle(selected_questions)
 
         # Create deep copies of selected questions to avoid modifying cached originals
         from copy import deepcopy
@@ -5221,6 +5255,7 @@ SHOP_CATALOGUE = [
     {"id": "glasses_round", "slot": "glasses",   "rarity": "common", "name": "Round Specs",  "cost": 0, "emoji": "🤓", "desc": "Smart and studious."},
     {"id": "bowtie_red",    "slot": "accessory", "rarity": "common", "name": "Red Bowtie",   "cost": 0, "emoji": "🎀", "desc": "Dapper and sharp."},
     {"id": "cape_red",      "slot": "backItem",  "rarity": "rare",   "name": "Hero Cape",    "cost": 0, "emoji": "🦸", "desc": "Save the leaderboard."},
+    {"id": "wings_angel",   "slot": "backItem",  "name": "Angel Wings", "cost": 10, "released": True, "emoji": "😇", "desc": "Ascend the ranks on feathered wings."},
 ]
 SHOP_BY_ID = {item["id"]: item for item in SHOP_CATALOGUE}
 
@@ -5376,11 +5411,12 @@ def get_shop(authorization: str = Header(None)):
             conn.close()
 
         age_days, shop_unlocked, days_until_unlock = _account_age_days(user_id)
-        # Only surface free items (skin tones) — buyable wearables are
-        # currently hidden from the shop. Item definitions stay in
-        # SHOP_CATALOGUE so already-equipped items still render and so the
-        # paid catalogue can be re-enabled by removing this filter.
-        visible_catalogue = [it for it in SHOP_CATALOGUE if int(it.get("cost", 0)) == 0]
+        # Surface free items (skin tones) PLUS any paid item explicitly
+        # marked "released": True. Unreleased paid items stay defined in
+        # SHOP_CATALOGUE (so equipped ones still render) but are hidden until
+        # flagged. To open the whole paid catalogue, drop this filter.
+        visible_catalogue = [it for it in SHOP_CATALOGUE
+                             if int(it.get("cost", 0)) == 0 or it.get("released")]
         return {
             "gems":                 gems,
             "owned":                owned,
