@@ -2862,11 +2862,15 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
 
         user_id = payload.get('user_id')
 
-        # Use frontend-provided score and questions if available (for retakes and accurate scoring)
+        # Score is computed SERVER-SIDE from the per-question grading below when
+        # full questions are provided — the same grade_answer() call that bakes
+        # is_correct into questions_data. This guarantees the attempt-level
+        # score/percentage (teacher tiles, weakest topics, drill-in rows) can
+        # never disagree with the per-question ✓/✗ flags (attempt review).
+        # The frontend-claimed score is only used as a cross-check + fallback.
         if request.score is not None and request.percentage is not None:
             score = request.score
             percentage = request.percentage
-            print(f"✅ Using frontend-calculated score: {score}/{request.count} ({percentage}%)")
         else:
             # Fallback: calculate score from filtered questions (for backwards compatibility)
             filtered_questions = cache.get_filtered_questions(
@@ -2884,7 +2888,7 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
                     if question_idx < len(filtered_questions):
                         question = filtered_questions[question_idx]
                         correct_answer = question.answer.strip()
-                        if answer_key(user_answer) == answer_key(correct_answer):
+                        if grade_answer(user_answer, correct_answer, question.options):
                             score += 1
                 except (ValueError, IndexError):
                     continue
@@ -2902,19 +2906,34 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
             # The skinny `questions_review` shape used to be persisted here, but it
             # stripped options/images and broke retakes — see get_quiz_for_retake().
             if request.questions:
-                # Use frontend-provided questions with calculated correctness
+                # Use frontend-provided questions; grade each one server-side.
                 full_questions_data = []
+                server_score = 0
                 for idx, q in enumerate(request.questions):
                     user_answer = request.user_answers.get(idx, "")
-                    correct_answer = q.get('answer', "").strip()
-                    is_correct = answer_key(user_answer) == answer_key(correct_answer)
+                    # Fall back to correct_answer for retake rows whose payload
+                    # carries the answer under that field instead of 'answer'.
+                    correct_answer = (q.get('answer') or q.get('correct_answer') or "").strip()
+                    is_correct = grade_answer(user_answer, correct_answer, q.get('options'))
+                    server_score += int(is_correct)
                     q_copy = q.copy()
                     q_copy['is_correct'] = is_correct
                     q_copy['user_answer'] = user_answer
                     q_copy['correct_answer'] = correct_answer
                     full_questions_data.append(q_copy)
                 full_questions_json = json.dumps(full_questions_data)
-                print(f"✅ Storing {len(full_questions_data)} questions from frontend with correctness")
+
+                # Server-side score is authoritative — it is derived from the
+                # exact flags stored above, so every stat stays consistent.
+                n_q = len(request.questions)
+                server_pct = round((server_score / n_q) * 100) if n_q else 0
+                if request.score is not None and int(request.score) != server_score:
+                    print(f"⚠️  Score mismatch user={user_id}: frontend claimed "
+                          f"{request.score}/{n_q}, server graded {server_score}/{n_q} "
+                          f"— storing server value")
+                score = server_score
+                percentage = server_pct
+                print(f"✅ Graded {n_q} questions server-side: {score}/{n_q} ({percentage}%)")
             else:
                 # Fallback: serialize filtered Question objects with correctness
                 filtered_questions = cache.get_filtered_questions(
@@ -2925,7 +2944,7 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
                 for idx, q in enumerate(filtered_questions[:request.count]):  # Only store the count requested
                     user_answer = request.user_answers.get(idx, "")
                     correct_answer = q.answer.strip()
-                    is_correct = answer_key(user_answer) == answer_key(correct_answer)
+                    is_correct = grade_answer(user_answer, correct_answer, q.options)
                     full_questions_data.append({
                         'uid': q.uid,
                         'qno': q.qno,
@@ -3051,10 +3070,13 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
                 except Exception:
                     xp_pre = 0
 
+                # Defined OUTSIDE the try — the XP-banking upsert below needs
+                # these even when the daily-credit block errors.
+                today_d = _effective_today(user_id)
+                _daily_subject = 'Physics'
+
                 # Daily-progress credit + streak award.
                 try:
-                    today_d = _effective_today(user_id)
-                    _daily_subject = 'Physics'
                     # Daily goal is fixed at 10 correct — no per-user setting.
                     user_daily_goal = DAILY_CORRECT_TARGET
                     _prev_p, _now_p, _today_correct, _today_total = _credit_daily_practice(
@@ -3116,10 +3138,18 @@ def submit_quiz_attempt(request: QuizSubmissionRequest, authorization: str = Hea
                         )
                         # Bank the same XP onto today's daily row so the
                         # daily / weekly leaderboards can rank by XP.
+                        # ATOMIC UPSERT — a plain UPDATE silently no-ops (and
+                        # the XP vanishes from the daily/weekly boards) when
+                        # the row doesn't exist yet, e.g. if the daily-credit
+                        # block above errored. score/total 0 so a row created
+                        # here never distorts the daily-goal tally.
                         cursor.execute(
-                            "UPDATE daily_challenges SET xp = xp + %s "
-                            "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
-                            (xp_delta, user_id, _daily_subject, today_d),
+                            "INSERT INTO daily_challenges "
+                            "(user_id, subject, challenge_date, score, total, "
+                            " percentage, passed, attempts, xp) "
+                            "VALUES (%s, %s, %s, 0, 0, 0, FALSE, 0, %s) "
+                            "ON DUPLICATE KEY UPDATE xp = xp + VALUES(xp)",
+                            (user_id, _daily_subject, today_d, xp_delta),
                         )
                         conn.commit()
                     cursor.execute("SELECT xp FROM users WHERE id = %s", (user_id,))
@@ -3906,14 +3936,73 @@ def get_user_stats(authorization: str = Header(None)):
 
 def answer_key(val) -> str:
     """Normalize an answer to a comparable key so option-text vs letter compares correctly.
-    "C. lamp X" -> "C",  "C" -> "C",  "C) foo" -> "C". Falls back to the
-    uppercased string when there is no A-D letter prefix."""
+    Mirrors the frontend answerKey() EXACTLY — the two MUST stay in sync or the
+    stored per-question is_correct flags disagree with the score the student saw.
+      "(3) 45 cm2" -> "3"   (PSLE numeric options "(1)"–"(4)")
+      "C. lamp X"  -> "C",  "C" -> "C",  "C) foo" -> "C"
+      "Density increases" -> "DENSITY INCREASES"  (delimiter after the letter is
+      REQUIRED — a bare leading letter must not swallow sentence options)."""
     if val is None:
         return ""
     s = str(val).strip()
-    if s and s[0] in "ABCDabcd" and (len(s) == 1 or s[1] in ".) :-"):
-        return s[0].upper()
+    m = re.match(r'^\((\d+)\)', s)
+    if m:
+        return m.group(1)
+    m = re.match(r'^([A-Da-d])(?:[\.\)\s:\-]|$)', s)
+    if m:
+        return m.group(1).upper()
     return s.upper()
+
+
+def _option_letter_and_body(line: str, idx: int) -> Tuple[str, str]:
+    """Split one option line into (letter/number label, body text), mirroring the
+    frontend's option-label logic. Falls back to the positional letter (A-D)."""
+    t = (line or "").strip()
+    m = re.match(r'^\((\d+)\)\s*(.*)$', t)          # PSLE "(1) …"
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r'^([A-Da-d])[\.\)\:\-]?\s+(.*)$', t)  # "A. foo" / "A) foo"
+    if m:
+        return m.group(1).upper(), m.group(2)
+    if re.fullmatch(r'[A-Da-d]', t):                # bare "A" (diagram options)
+        return t.upper(), ""
+    return chr(65 + idx), t                          # unlabelled sentence option
+
+
+def grade_answer(user_answer, correct_answer, options=None) -> bool:
+    """THE single source of truth for whether an answer is correct.
+
+    1. Compare normalized keys (letter / PSLE number / full-text uppercase).
+    2. If that fails and the question has an options list, resolve BOTH sides
+       to an option label via the options (handles answer stored as full text
+       while the pick is a letter, and vice versa) and compare labels.
+
+    Every place that grades — submit, regrade script, stats — must call this,
+    never raw string comparison."""
+    uk = answer_key(user_answer)
+    ck = answer_key(correct_answer)
+    if uk and ck and uk == ck:
+        return True
+    if not options or not uk or not ck:
+        return False
+
+    lines = [l.strip() for l in str(options).split('\n') if l.strip()]
+    if not lines:
+        return False
+
+    def resolve(raw, key):
+        s = str(raw or "").strip().upper()
+        for i, line in enumerate(lines):
+            letter, body = _option_letter_and_body(line, i)
+            if s and (s == line.strip().upper() or (body and s == body.strip().upper())):
+                return letter.upper()
+            if key and key == answer_key(line):
+                return letter.upper()
+        return key  # already a label, or unresolvable — compare as-is
+
+    ru = resolve(user_answer, uk)
+    rc = resolve(correct_answer, ck)
+    return bool(ru) and ru == rc
 
 
 def score_to_band(percentage: float) -> str:
@@ -5695,6 +5784,7 @@ def get_teacher_overview(
               u.id, u.name,
               COUNT(DISTINCT DATE(qa.attempted_at)) AS days_active_7d,
               COUNT(qa.id) AS quizzes_7d,
+              ROUND(AVG(qa.percentage), 1) AS avg_pct_7d,
               MAX(qa.attempted_at) AS last_active,
               COALESCE(s.current_streak, 0) AS current_streak,
               COALESCE(s.longest_streak, 0) AS longest_streak
@@ -5769,13 +5859,14 @@ def get_teacher_overview(
         days_count = 0
         streak_3plus = 0
         for row in consistency_rows:
-            uid, uname, days, quizzes, last_active, cur_streak, long_streak = row
+            uid, uname, days, quizzes, avg_pct_7d, last_active, cur_streak, long_streak = row
             days_int = int(days or 0)
             consistency.append({
                 "id":             int(uid),
                 "name":           uname or "Student",
                 "days_active_7d": days_int,
                 "quizzes_7d":     int(quizzes or 0),
+                "avg_pct_7d":     float(avg_pct_7d) if avg_pct_7d is not None else None,
                 "last_active":    str(last_active) if last_active else None,
                 "current_streak": int(cur_streak or 0),
                 "longest_streak": int(long_streak or 0),
