@@ -16,7 +16,9 @@ Over my 22-week internship at Curious Lab I was the full-stack developer for **O
 ## 2. Conceiving & Designing
 
 ### 2.1 Problem & scope
-Curious Lab needed two things that did not exist yet: (a) a fast, repeatable way to convert the large backlog of real exam papers into a *digital, queryable* question bank, because manually retyping papers and re-drawing diagrams does not scale; and (b) a student-facing product that makes daily practice sticky rather than a chore. The deliverable was a working, deployed app backed by an automated content pipeline, covering Pure Physics and Combined Science (Physics) across the G1/G2/G3 bands, and later extended to P6 Mathematics.
+**The core problem:** homework is tedious, and it gives students no immediate feedback. A student can work through a whole set of questions and only find out days later what they got wrong — by which point the learning moment has passed and the habit of practising has already been made to feel like a chore. Ooka was conceived to attack both halves of that problem: make practice feel rewarding rather than tedious, and give feedback the instant a question is answered.
+
+To deliver that, Curious Lab needed two things that did not exist yet: (a) a fast, repeatable way to convert the large backlog of real exam papers into a *digital, queryable* question bank, because manually retyping papers and re-drawing diagrams does not scale; and (b) a student-facing product that makes daily practice sticky rather than a chore. The deliverable was a working, deployed app backed by an automated content pipeline, covering Pure Physics and Combined Science (Physics) across the G1/G2/G3 bands, and later extended to P6 Mathematics.
 
 **Outcome (by end of internship):** ~**130 exam papers** processed into the bank — roughly **91 Combined G3, 24 Pure Physics, 7 Combined G2, 3 Combined G1, and 5 P6 Math (PSLE)** — and Ooka deployed and in a **test phase with ~22 students**.
 
@@ -84,6 +86,25 @@ The app is deployed as: **front end on Cloudflare Pages**, **backend on Render (
 
 ---
 
+## 3.8 Working with my supervisor and the team
+
+*(This maps to the report's "student involvement and teamwork" criterion — worth 20 marks — so it deserves real detail.)*
+
+The project was collaborative from the very start rather than a brief handed over and collected at the end. My supervisor **Mr Marcus Yip** and the founder **Lloyd** together defined the **problem statement** and what the company needed solved. I then **brainstormed the solution alongside them**, and Ooka — an app that makes daily practice rewarding and gives instant feedback — came out of those discussions rather than from any one person.
+
+Roles were clearly divided. Marcus **managed me day to day**: answering my questions, reviewing my work and giving feedback. Lloyd, as founder, made the **final call on what shipped**. I was the **sole developer** — I did the brainstorming, designed and built the entire system, and also **vetted the extracted question content** myself. This meant I owned the product end to end rather than a single sandboxed slice of it, with a direct line to the person making the decisions.
+
+Throughout the build I worked alongside the team continuously:
+
+- **Weekly updates** on the app's progress, so the team always had visibility of what was working and what wasn't.
+- **Frequent meetings** where we discussed the app's trajectory and roadmap, and agreed what was urgent versus what could wait — this is where prioritisation decisions were made.
+- **Regular feedback loops**, where the team gave me a great deal to change and refine so the product better suited our **target audience** of students. A lot of my work was responding to that feedback rather than building in isolation.
+- **A mid-project rebrand**, decided together partway through production, which changed the app's identity (HabitGo → Ooka), its mascot and its visual direction.
+
+Two of the biggest design changes in the project — the **rebrand** and the **pivot from grade-style ranks to a consistency-based XP system** — came directly out of these discussions. That feedback loop is also what kept the product aimed at students rather than at what was merely convenient to build.
+
+---
+
 ## 4. The Hardest Problems I Faced
 
 Pick 2–3 of these to write up in depth for the report — depth on a couple of hard problems (with what you tried, what failed, and how you solved it) is what pushes the grade up. Each below is structured as *problem → attempts → resolution* so it's ready to expand.
@@ -143,8 +164,91 @@ Almost everything is now filled from your answers and the codebase:
 7. ✅ **Week 22 optimisation** — full list reconstructed from the code. *(§4.7)*
 8. ⏳ **Screenshots** — you'll send these; I'll place them as figures.
 
-**Still to gather from you (the non-technical sections):**
-- **Problem framing (point 1):** in your own words, the gap Ooka solves and why Curious Lab wanted it — I have a technical version, but your voice here is good.
-- **Results/impact (point 4):** any feedback from the 22 test students, and how the work helped Curious Lab.
-- **Team (point 5):** how you worked with Marcus (supervisor) — what he directed vs. what you decided/proposed (e.g. the rebrand, the rank→XP pivot, the syllabus restructure).
-- Plus the company / industry / careers / reflection sections for the full report.
+---
+
+## 5B. About the Company & About the Industry (drafted)
+
+### Company structure and culture
+Curious Lab is a small, lean, **remote-first** EdTech company. **Lloyd**, the founder, personally teaches the tuition classes and makes the final decision on what ships; **Mr Marcus Yip**, my supervisor, managed me day to day, answered my questions and reviewed my work; I was the **sole developer**. The team works remotely, meeting at the tuition centres Curious Lab rents when needed.
+
+> ⚠️ **Do not state team headcount anywhere.** Ezell does not want the company's exact size disclosed. Use "a small company", "a company of this size", "a lean team" — never a number or a list of every person.
+
+*Org chart (figure):* Founder (Lloyd) → { Teaching — Lloyd } + { Technology — me (developer), reporting through Marcus (supervisor) } + { Marketing }.
+
+**Culture and what it demanded of me.** A team this size has no layers: my work went straight to the founder, and decisions were made in days rather than through approval chains. The trade-off is that a small remote company gives you enormous autonomy but expects you to be **self-directed** — there was nobody looking over my shoulder, so I had to plan my own week, unblock myself, and bring problems to Marcus already framed. This is the clearest example of Self-Directed Learning in my internship.
+
+**How work flowed.** Marcus and Lloyd set the problem; I brainstormed, designed and built the solution; I vetted the extracted question content; I gave **weekly updates** and met frequently with both to discuss the roadmap and what was urgent; Lloyd decided what shipped.
+
+### How the industry is organised
+**Customers.** Curious Lab's paying customers are the **students and parents** of its tuition classes. Ooka is currently **free**, tested with the company's own students, and the intended model is **subscription**. The wider plan is to sell the tools — Ooka included — **into MOE schools**.
+
+**Why they choose Curious Lab.** The company's differentiator is not one app but an **ecosystem of learning tools**: practice on real exam papers, **immediate feedback** on every question, gamification that keeps studying consistent rather than boring, planned **monthly report cards** so parents can see their child's growth, and a **teacher dashboard** that shows where each student is strong and weak so teachers can target help.
+
+**The industry environment.** Singapore's tuition market is large and crowded — households spent **S$1.8 billion** on private tuition in 2024, **over 70%** of students receive tutoring, and there are 1,000+ tuition centres. Direct EdTech competitors include **Geniebook** (AI-personalised worksheets, live classes, ~US$18M raised), **KooBits** (gamified primary maths — closest to Ooka's P6 Math and gamification), **Superstar Teacher**, large chains such as The Learning Lab, and increasingly **free general AI tools** that students use to get answers explained. MOE's own **Student Learning Space (SLS)** is both a competitor and a potential route into schools.
+
+**Equity angle (a genuine differentiator).** Average household tuition spend is **S$104.80/month**, but the top 20% of earners spend **S$162.60** against just **S$36.30** for the bottom 20%. A **free** tool built on real exam papers directly narrows that gap — a social case, not a marketing one.
+
+**Business strategy — how it stays relevant.** Two things. First, **keeping current with the syllabus**: I personally migrated the question bank and pipeline to the new MOE syllabus (Combined G1/G2/G3 and Pure Physics), which is what keeps the content usable. Second, **aligning to national policy**: MOE's **EdTech Masterplan 2030** commits all 360 public schools to hybrid learning with **learning analytics and AI-assisted feedback** by 2030, with ~97% of schools already running e-learning platforms and S$700M+ invested in digital infrastructure. The teacher dashboard I built — class averages, weakest topics, consistency tracking — is precisely that learning-analytics capability, so the company's plan to sell into MOE schools is aligned to a stated national direction rather than being speculative.
+
+> **References for the Annex:** MOE EdTech Masterplan 2030; NIE/NTU on Singapore's private tutoring; Tracxn company profiles for Geniebook and KooBits; Nexdigm Singapore education industry report.
+
+### Careers in the company and the industry
+
+**Recruitment — how people get in.** I joined through a **referral from my former school teacher** rather than a formal hiring pipeline, which is typical of a company this size: small teams hire through trust and personal networks rather than structured graduate programmes. What Curious Lab was looking for was **coding ability and hands-on experience in AI and software development** — precisely the areas I had built up studying Computer Engineering at SP. My diploma was not background context for this internship; it was the reason I was considered for it.
+
+**Training — a startup model, not a corporate one.** There was **no formal training programme and no WSQ-certified courses**. Instead I was given **ample time to research and learn whatever the work required** — OCR was the first example, and there were many after it — with **people available to ask when I got stuck**, primarily Marcus. This is a deliberate contrast with how a large organisation onboards: a big agency runs structured multi-year development programmes, whereas a small company invests in you by giving you time to learn and a direct line to someone who can unblock you. The trade-off is real: you learn faster and more broadly, but only if you are genuinely self-directed.
+
+**Career progression.** In a company of four there is no formal ladder to climb. Growth comes through **ownership** — over the internship I moved from building an extraction script to owning an entire deployed product and its content pipeline. We did **discuss my continuing after the internship as a software engineer**, though nothing was formalised beyond those discussions.
+
+**Retention — what keeps people here.** For me it was the work itself: **building things that real people actually use**. Getting positive feedback from students who were using something I had built gave me a real sense of accomplishment that I do not think I would get from work that sits unused in a repository. In a small company the connection between what you build and the person it helps is direct and visible — which is exactly what larger organisations struggle to give junior staff.
+
+**Prospects, and whether this appeals to me.** Singapore's EdTech sector sits on a S$1.8 billion tuition market with MOE actively pushing digital learning through the EdTech Masterplan 2030, so the sector has room to grow and a clear policy tailwind. **I would genuinely like to work in this industry after graduating** — I feel that I am actually contributing something to it. For polytechnic graduates specifically, small EdTech companies offer something big firms rarely do: the chance to own a whole product early. The honest counterweight is that a small company offers less structure, less formal training, and less job security than an established organisation, so it suits someone who is self-directed and wants breadth over specialisation.
+
+---
+
+## 6. Screenshot shot list (capture these)
+
+**Before you start:** log in as a **test student account that already has a streak going, some XP, and a few past attempts** — empty states look unfinished. Use **light mode** (prints far better). Crop out anything personal (real names/emails — rename the test user to something like "Demo Student"). Capture at full window size, PNG, no phone photos of the screen.
+
+### Tier 1 — must have (the 4 that carry both the report and the poster)
+
+| # | Screen | What must be visible | Used for |
+|---|---|---|---|
+| 1 | **Home / dashboard** | Streak count, XP progress bar + level tier, the daily-challenge card, weekly strip | **Poster placeholder 1** + report "gamified loop" |
+| 2 | **Quiz builder** (QuizMaker) | Level (Pure/Combined), topic checkboxes, difficulty tiles, question count — ideally with a **greyed-out/unavailable difficulty** showing the availability logic | Report §3.3 — this proves real engineering, not just UI |
+| 3 | **A question with its extracted diagram** | The question text *and* an extracted diagram image rendering correctly | **The single most important shot** — it's the visual proof the extraction pipeline works end-to-end |
+| 4 | **Results screen** | Score, accuracy, time taken, XP earned — with the **level-up / rank-up celebration overlay** if you can trigger one | **Poster placeholder 2** — instant feedback, the core problem being solved |
+
+### Tier 2 — strongly recommended (report figures)
+
+| # | Screen | What must be visible |
+|---|---|---|
+| 5 | **Google Sheet question bank** | Several rows with the columns visible: question text, answer, Difficulty, Marks, Subtopic, SIO code, `IMAGE:` reference. Shows the pipeline's *output structure* |
+| 6 | **Google Drive image folder** | A grid of extracted diagram PNGs — visual evidence of scale (~130 papers' worth) |
+| 7 | **Teacher dashboard** | Week-at-a-glance stats, weakest topics, student consistency |
+| 8 | **Leaderboard** | Podium top-3 with avatars + the Daily/Weekly/All-time tabs |
+| 9 | **Avatar shop** | The Ooka monkey with skin tones + hoodie, live preview — evidence of the rebrand work |
+| 10 | **Streak + freeze UI** | Streak counter with a freeze available/used state |
+
+### Tier 3 — nice to have (for the "hardest problems" section)
+
+| # | Shot | Why it's gold |
+|---|---|---|
+| 11 | **Before/after of diagram extraction** | A *bad* early crop (cut-off/noisy diagram) beside a *good* final one. If you still have any failed output, this single figure tells your hardest-problem story better than a paragraph |
+| 12 | **Extraction pipeline running** | Terminal output of a paper being processed — rows/images extracted |
+| 13 | **The sheet's multiple level tabs** | `Pure Physics`, `combinedG3/G2/G1`, P6 Math tabs — shows the syllabus migration work |
+
+### Where each goes
+- **Poster (2 slots):** #1 and #4 — or swap #4 for #3 if the diagram render looks striking.
+- **Report:** #2, #3, #5, #7 in the Implementing section; #11 in the Hardest Problems section; #6 or #13 as evidence of scale.
+
+---
+
+**Status — all sections now gathered:**
+- ✅ **Problem framing** — homework is tedious and lacks immediate feedback. *(§2.1)*
+- ✅ **Team** — Marcus + Lloyd set the problem; you were sole developer. *(§3.8)*
+- ✅ **Company** — lean remote-first EdTech company, 4 people. *(§5B)*
+- ✅ **Industry** — customers, competitors, market data, Masterplan 2030 alignment. *(§5B)*
+- ✅ **Careers** — recruitment, training, progression, retention, your own view. *(§5B)*
+- ✅ **Screenshots** — captured: `ooka_01`–`ooka_10` + `ooka_architecture.png`.
+- ⚪ **Optional:** feedback from the 22 test students (deprioritised).
