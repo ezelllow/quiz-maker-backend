@@ -5779,23 +5779,43 @@ def get_teacher_overview(
         # 4) Per-student consistency: how many of the last 7 days each student
         # showed up, plus quiz volume and streak length. Sorted most-consistent
         # first so the teacher can scan top-to-bottom.
+        #
+        # Volume is reported BOTH ways ("show both" policy):
+        #   - attempts  = every submitted attempt, retakes included (effort)
+        #   - quizzes   = distinct quizzes, retakes collapsed onto their
+        #                 parent_attempt_id root (coverage)
+        # and BOTH windows: last-7-days and all-time — so a student who did
+        # 5 quizzes last month and 1 this week reads "1 this week · 6 all-time"
+        # instead of the misleading bare "1 quiz".
         cursor.execute(f"""
             SELECT
               u.id, u.name,
               COUNT(DISTINCT DATE(qa.attempted_at)) AS days_active_7d,
               COUNT(qa.id) AS quizzes_7d,
+              COUNT(DISTINCT COALESCE(qa.parent_attempt_id, qa.id)) AS distinct_quizzes_7d,
               ROUND(AVG(qa.percentage), 1) AS avg_pct_7d,
               MAX(qa.attempted_at) AS last_active,
               COALESCE(s.current_streak, 0) AS current_streak,
-              COALESCE(s.longest_streak, 0) AS longest_streak
+              COALESCE(s.longest_streak, 0) AS longest_streak,
+              COALESCE(tot.attempts_all, 0) AS attempts_all,
+              COALESCE(tot.quizzes_all, 0) AS quizzes_all
             FROM users u
             LEFT JOIN quiz_attempts qa
               ON qa.user_id = u.id
              AND qa.attempted_at >= NOW() - INTERVAL 7 DAY
              {qt_clause}
             LEFT JOIN streaks s ON s.user_id = u.id
+            LEFT JOIN (
+                SELECT qa.user_id,
+                       COUNT(*) AS attempts_all,
+                       COUNT(DISTINCT COALESCE(qa.parent_attempt_id, qa.id)) AS quizzes_all
+                FROM quiz_attempts qa
+                WHERE 1=1{qt_clause}
+                GROUP BY qa.user_id
+            ) tot ON tot.user_id = u.id
             WHERE u.is_teacher = FALSE
-            GROUP BY u.id, u.name, s.current_streak, s.longest_streak
+            GROUP BY u.id, u.name, s.current_streak, s.longest_streak,
+                     tot.attempts_all, tot.quizzes_all
             ORDER BY days_active_7d DESC, quizzes_7d DESC, u.name ASC
         """)
         consistency_rows = cursor.fetchall()
@@ -5859,13 +5879,19 @@ def get_teacher_overview(
         days_count = 0
         streak_3plus = 0
         for row in consistency_rows:
-            uid, uname, days, quizzes, avg_pct_7d, last_active, cur_streak, long_streak = row
+            (uid, uname, days, quizzes, distinct_quizzes, avg_pct_7d, last_active,
+             cur_streak, long_streak, attempts_all, quizzes_all) = row
             days_int = int(days or 0)
             consistency.append({
                 "id":             int(uid),
                 "name":           uname or "Student",
                 "days_active_7d": days_int,
-                "quizzes_7d":     int(quizzes or 0),
+                # quizzes_7d kept for backwards compat = attempts this week.
+                "quizzes_7d":          int(quizzes or 0),
+                "attempts_7d":         int(quizzes or 0),
+                "distinct_quizzes_7d": int(distinct_quizzes or 0),
+                "attempts_all":        int(attempts_all or 0),
+                "quizzes_all":         int(quizzes_all or 0),
                 "avg_pct_7d":     float(avg_pct_7d) if avg_pct_7d is not None else None,
                 "last_active":    str(last_active) if last_active else None,
                 "current_streak": int(cur_streak or 0),

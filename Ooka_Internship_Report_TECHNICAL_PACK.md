@@ -169,13 +169,13 @@ Almost everything is now filled from your answers and the codebase:
 ## 5B. About the Company & About the Industry (drafted)
 
 ### Company structure and culture
-Curious Lab is a small, lean, **remote-first** EdTech company. **Lloyd**, the founder, personally teaches the tuition classes and makes the final decision on what ships; **Mr Marcus Yip**, my supervisor, managed me day to day, answered my questions and reviewed my work; I was the **sole developer**. The team works remotely, meeting at the tuition centres Curious Lab rents when needed.
+Curious Lab is a small, lean EdTech company. **Lloyd**, the founder, personally teaches the tuition classes and makes the final decision on what ships; **Mr Marcus Yip**, my supervisor, managed me day to day, answered my questions and reviewed my work; I was the **sole developer**. The team works remotely, meeting at the tuition centres Curious Lab rents when needed.
 
-> ⚠️ **Do not state team headcount anywhere.** Ezell does not want the company's exact size disclosed. Use "a small company", "a company of this size", "a lean team" — never a number or a list of every person.
+> ⚠️ **Do not state team headcount anywhere**, and **do not emphasise working from home** (at most "about one day a week", but prefer to omit it). Ezell does not want either the company's exact size or a work-from-home arrangement disclosed. Use "a small company", "a company of this size", "a lean team" — never a number, and frame autonomy around being the sole developer rather than remote work.
 
 *Org chart (figure):* Founder (Lloyd) → { Teaching — Lloyd } + { Technology — me (developer), reporting through Marcus (supervisor) } + { Marketing }.
 
-**Culture and what it demanded of me.** A team this size has no layers: my work went straight to the founder, and decisions were made in days rather than through approval chains. The trade-off is that a small remote company gives you enormous autonomy but expects you to be **self-directed** — there was nobody looking over my shoulder, so I had to plan my own week, unblock myself, and bring problems to Marcus already framed. This is the clearest example of Self-Directed Learning in my internship.
+**Culture and what it demanded of me.** A team this size has no layers: my work went straight to the founder, and decisions were made in days rather than through approval chains. The trade-off is that a small company gives you enormous autonomy but expects you to be **self-directed** — as the only developer, there was nobody checking my work line by line, so I had to plan my own week, unblock myself, and bring problems to Marcus already framed. This is the clearest example of Self-Directed Learning in my internship.
 
 **How work flowed.** Marcus and Lloyd set the problem; I brainstormed, designed and built the solution; I vetted the extracted question content; I gave **weekly updates** and met frequently with both to discuss the roadmap and what was urgent; Lloyd decided what shipped.
 
@@ -247,7 +247,7 @@ Curious Lab is a small, lean, **remote-first** EdTech company. **Lloyd**, the fo
 **Status — all sections now gathered:**
 - ✅ **Problem framing** — homework is tedious and lacks immediate feedback. *(§2.1)*
 - ✅ **Team** — Marcus + Lloyd set the problem; you were sole developer. *(§3.8)*
-- ✅ **Company** — lean remote-first EdTech company, 4 people. *(§5B)*
+- ✅ **Company** — small, lean EdTech company (headcount not disclosed). *(§5B)*
 - ✅ **Industry** — customers, competitors, market data, Masterplan 2030 alignment. *(§5B)*
 - ✅ **Careers** — recruitment, training, progression, retention, your own view. *(§5B)*
 - ✅ **Screenshots** — captured: `ooka_01`–`ooka_10` + `ooka_architecture.png`.
