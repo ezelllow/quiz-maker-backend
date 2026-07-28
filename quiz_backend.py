@@ -7,6 +7,7 @@ Returns filtered quizzes based on difficulty, subtopic, and count
 import os
 import random
 import re
+import time
 from typing import List, Optional, Tuple, Dict
 from collections import defaultdict, OrderedDict
 import threading
@@ -70,6 +71,14 @@ SHEET_NAMES = [
     for name in (os.getenv('SHEET_NAMES') or os.getenv('SHEET_NAME') or 'Pure Physics,combinedG1,combinedG2,combinedG3').split(',')
     if name.strip()
 ]
+
+# How long the in-memory question bank is trusted before the Sheet is checked
+# for changes again (stale-while-revalidate: the check runs in a background
+# thread, requests are never blocked on it). Set 0 to disable auto-refresh.
+QUESTIONS_CACHE_TTL_SECONDS = int(os.getenv('QUESTIONS_CACHE_TTL_SECONDS', '300'))
+# Optional shared secret for POST /api/admin/refresh (?key=... or X-Refresh-Key
+# header). When unset, the endpoint requires a teacher JWT instead.
+ADMIN_REFRESH_KEY = os.getenv('ADMIN_REFRESH_KEY', '').strip()
 
 # Google API Scopes
 SCOPES = [
@@ -873,6 +882,10 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
+# Password every teacher-initiated reset falls back to. Students sign in with
+# this and are expected to change it in Settings afterwards.
+DEFAULT_RESET_PASSWORD = "Curious"
+
 def create_jwt_token(user_id: int, email: str, is_teacher: bool = False) -> str:
     """Create a JWT token for the user. `is_teacher` is baked into the claim
     so the frontend can route a teacher straight into the teacher dashboard
@@ -922,6 +935,15 @@ class QuestionCache:
         # Serializes load_questions/load_file_map — with threadpool handlers
         # two threads could otherwise parse/scan simultaneously.
         self._load_lock = threading.Lock()
+        # ── Staleness tracking (auto-refresh) ──
+        # loaded_at: when the bank was last (re)parsed or last confirmed fresh.
+        # sheet_fingerprint: Drive modifiedTime of the source workbook(s) at
+        # load time — lets revalidation skip the expensive re-parse when the
+        # Sheet hasn't actually changed.
+        self.loaded_at = 0.0
+        self.sheet_fingerprint = None
+        self._revalidate_gate = threading.Lock()
+        self._revalidating = False
 
     def load_file_map(self, force=False):
         """Pre-load every image under QUESTION_FOLDER_IDS into memory for lookup.
@@ -1063,14 +1085,109 @@ class QuestionCache:
                 return
             return self._load_questions_unlocked()
 
+    # ── Auto-refresh (stale-while-revalidate) ────────────────────────────
+    #
+    # The bank used to be loaded ONCE at startup and then served forever, so
+    # rows deleted from the Sheet (or images re-uploaded under new Drive IDs)
+    # kept appearing until the server was restarted. ensure_fresh() fixes
+    # that: once the TTL expires, the NEXT request kicks off a background
+    # thread that asks Drive for the workbook's modifiedTime (one cheap API
+    # call) and re-parses only if the Sheet actually changed. Requests are
+    # never blocked — they serve the current bank while the check/reload
+    # runs ("stale-while-revalidate"). Grading is unaffected by mid-quiz
+    # reloads because /api/quiz/submit grades the questions echoed back by
+    # the frontend, not a fresh cache lookup.
+
+    def _get_sheet_fingerprint(self):
+        """Drive modifiedTime of the source workbook(s), or None if the
+        Drive API is unavailable / the file isn't visible to the service
+        account. None disables the 'skip reload if unchanged' shortcut —
+        revalidation then reloads on every TTL expiry (safe, just costlier)."""
+        drive = get_drive_service()
+        if not drive:
+            return None
+        stamps = []
+        for sid in (SPREADSHEET_ID, P6_MATH_SPREADSHEET_ID):
+            if not sid:
+                continue
+            try:
+                meta = drive.files().get(
+                    fileId=sid, fields='modifiedTime', supportsAllDrives=True,
+                ).execute()
+                stamps.append(meta.get('modifiedTime'))
+            except Exception as e:
+                print(f"⚠️  Could not read modifiedTime for {sid}: {e}")
+                return None
+        return tuple(stamps) if stamps else None
+
+    def ensure_fresh(self):
+        """Cheap staleness gate — call at the top of question-serving paths.
+
+        First load is synchronous (nothing to serve yet). After that, when
+        the TTL has expired, spawn ONE background revalidation thread and
+        return immediately with the current bank."""
+        if not self.is_loaded:
+            self.load_questions()
+            return
+        if QUESTIONS_CACHE_TTL_SECONDS <= 0:
+            return  # auto-refresh disabled
+        if time.time() - self.loaded_at < QUESTIONS_CACHE_TTL_SECONDS:
+            return
+        with self._revalidate_gate:
+            if self._revalidating:
+                return  # a check is already in flight
+            self._revalidating = True
+        threading.Thread(target=self._background_revalidate,
+                         daemon=True, name="sheet-revalidate").start()
+
+    def _background_revalidate(self):
+        try:
+            current = self._get_sheet_fingerprint()
+            if current is not None and current == self.sheet_fingerprint:
+                # Sheet untouched — just extend the TTL, skip the re-parse.
+                self.loaded_at = time.time()
+                return
+            print("🔄 Sheet changed (or fingerprint unavailable) — reloading question bank...")
+            self.refresh()
+        except Exception as e:
+            # Don't hammer the API on persistent errors; try again next TTL.
+            print(f"⚠️  Background revalidation failed: {e}")
+            self.loaded_at = time.time()
+        finally:
+            with self._revalidate_gate:
+                self._revalidating = False
+
+    def refresh(self, rescan_files=True):
+        """Force a full reload of the question bank from the Sheet.
+
+        Also clears the per-UID image URL cache and (by default) rescans the
+        Drive file map in a background thread, so images re-uploaded under a
+        NEW Drive file ID resolve again instead of 404ing on the stale ID."""
+        with self._load_lock:
+            self._load_questions_unlocked()
+        self.image_url_cache = {}
+        if rescan_files:
+            threading.Thread(target=self.load_file_map, kwargs={'force': True},
+                             daemon=True, name="drive-rescan").start()
+        return len(self.questions)
+
     def _load_questions_unlocked(self):
-        # Reset before (re)parsing — a failed earlier attempt must not leave
-        # partial rows for a retry to append onto (duplicated question bank).
-        self.questions = []
-        self.setup_info_map = {}
+        # Parse into LOCAL lists and swap into place only at the very end.
+        # Two reasons: (1) a failed attempt can never leave partial rows for a
+        # retry to append onto (duplicated question bank), and (2) background
+        # auto-refresh reloads happen while request threads are reading
+        # self.questions — they must keep seeing the complete old bank until
+        # the new one is fully parsed (atomic reference swap).
+        new_questions = []
+        new_setup_info = {}
 
         if not get_sheets_service():
             raise RuntimeError("Google Sheets API not initialized")
+
+        # Snapshot the workbook fingerprint BEFORE reading rows — if the Sheet
+        # is edited mid-parse, the next revalidation sees a changed fingerprint
+        # and reloads again (never wrongly concludes "already up to date").
+        fingerprint = self._get_sheet_fingerprint()
 
         try:
             # One batchGet fetches every tab in a single API call. BUT if any
@@ -1230,7 +1347,7 @@ class QuestionCache:
                         if not setup_file_id and options.upper().startswith('IMAGE:'):
                             setup_file_id = options.split(':', 1)[1].strip()
                             print(f"       diagram from Options IMAGE ref: {setup_file_id}")
-                        self.setup_info_map[main_uid] = {
+                        new_setup_info[main_uid] = {
                             'text': question_text,
                             'file_id': setup_file_id  # Can be None
                         }
@@ -1263,12 +1380,18 @@ class QuestionCache:
                         options_image_uid=options_image_uid,
                         explanation=explanation
                     )
-                    self.questions.append(question)
+                    new_questions.append(question)
 
                 except Exception as e:
                     print(f"⚠️  Error parsing row {row_idx}: {e}")
                     continue
 
+            # Atomic swap — readers see either the old complete bank or the
+            # new complete bank, never a half-parsed one.
+            self.questions = new_questions
+            self.setup_info_map = new_setup_info
+            self.sheet_fingerprint = fingerprint
+            self.loaded_at = time.time()
             self.is_loaded = True
             print(f"✅ Loaded {len(self.questions)} questions from sheet")
 
@@ -1374,8 +1497,7 @@ class QuestionCache:
 
     def get_unique_subtopics(self) -> List[str]:
         """Get all unique subtopics (excluding 'Question setup')"""
-        if not self.is_loaded:
-            self.load_questions()
+        self.ensure_fresh()
 
         subtopics = set()
         for q in self.questions:
@@ -1386,8 +1508,7 @@ class QuestionCache:
 
     def get_unique_difficulties(self) -> List[str]:
         """Get all unique difficulties"""
-        if not self.is_loaded:
-            self.load_questions()
+        self.ensure_fresh()
 
         difficulties = set()
         for q in self.questions:
@@ -1398,8 +1519,7 @@ class QuestionCache:
 
     def get_unique_levels(self) -> List[str]:
         """Get all unique levels (streams/subjects)"""
-        if not self.is_loaded:
-            self.load_questions()
+        self.ensure_fresh()
 
         levels = set()
         for q in self.questions:
@@ -1410,8 +1530,7 @@ class QuestionCache:
 
     def get_unique_subjects(self) -> List[str]:
         """Get all unique subjects (defaults to ['Physics'] when no Subject column)."""
-        if not self.is_loaded:
-            self.load_questions()
+        self.ensure_fresh()
         subjects = set()
         for q in self.questions:
             if q.subject:
@@ -1423,8 +1542,7 @@ class QuestionCache:
                                level: Optional[str] = None,
                                subject: Optional[str] = None) -> List[Question]:
         """Get questions filtered by difficulty and subtopic"""
-        if not self.is_loaded:
-            self.load_questions()
+        self.ensure_fresh()
 
         filtered = [q for q in self.questions]
 
@@ -1459,8 +1577,7 @@ cache = QuestionCache()
 
 def categorize_all_questions() -> Dict[str, List[Question]]:
     """Get all questions organized by type (TEXT, TABLE, IMAGE)"""
-    if not cache.is_loaded:
-        cache.load_questions()
+    cache.ensure_fresh()
 
     categorized = {
         'TEXT': [],
@@ -1543,6 +1660,39 @@ app.add_middleware(
 def health_check():
     """Health check endpoint"""
     return {"status": "ok", "questions_loaded": cache.is_loaded}
+
+
+@app.post("/api/admin/refresh")
+def admin_refresh(
+    authorization: str = Header(None),
+    x_refresh_key: str = Header(None),
+    key: Optional[str] = None,
+):
+    """Force an immediate reload of the question bank from the Sheet.
+
+    Use right after editing the Sheet instead of waiting out the auto-refresh
+    TTL (QUESTIONS_CACHE_TTL_SECONDS, default 5 min). Also clears the image
+    URL cache and rescans the Drive file map in the background, so images
+    re-uploaded under new Drive IDs resolve again.
+
+    Auth: a valid teacher JWT (Authorization: Bearer ...), OR — if the
+    ADMIN_REFRESH_KEY env var is set — a matching ?key= param / X-Refresh-Key
+    header (handy for curl / a Sheets Apps Script hook without a login)."""
+    provided_key = (key or x_refresh_key or '').strip()
+    if ADMIN_REFRESH_KEY and provided_key == ADMIN_REFRESH_KEY:
+        pass  # shared-secret auth OK
+    else:
+        require_teacher(authorization)  # raises 401/403 if not a teacher
+
+    try:
+        count = cache.refresh()
+        return {
+            "status": "ok",
+            "questions_loaded": count,
+            "file_map_rescan": "started in background",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Reload failed: {e}")
 
 # 6091 Physics (O-Level) syllabus topic sequences. Pure and Combined physics
 # have different topic sets / orders; these drive the build-form filter order.
@@ -1862,8 +2012,7 @@ def get_subtopics(level: str = None):
     """Available topics, optionally filtered to one physics level.
     `level` = 'pure' or 'nonpure' (non-pure == the sheet's '4E5N' Level)."""
     try:
-        if not cache.is_loaded:
-            cache.load_questions()
+        cache.ensure_fresh()
 
         cat = (level or '').strip().lower()
         if cat:
@@ -1890,8 +2039,7 @@ def get_availability(level: str = None):
     topic per difficulty at the chosen level. Lets the frontend grey out a
     difficulty when the picked topics can't supply enough questions."""
     try:
-        if not cache.is_loaded:
-            cache.load_questions()
+        cache.ensure_fresh()
 
         cat = (level or '').strip().lower()
         req_key = _level_key(level) if cat else None
@@ -4023,8 +4171,7 @@ def score_to_band(percentage: float) -> str:
 def get_subjects():
     """All subjects present in the question bank (defaults to [\'Physics\'])."""
     try:
-        if not cache.is_loaded:
-            cache.load_questions()
+        cache.ensure_fresh()
         return cache.get_unique_subjects()
     except Exception as e:
         print(f"\u274c Error in /api/subjects: {e}")
@@ -4040,8 +4187,7 @@ def get_placement_questions(subject: str = "Physics", authorization: str = Heade
         if not verify_jwt_token(authorization.replace("Bearer ", "")):
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-        if not cache.is_loaded:
-            cache.load_questions()
+        cache.ensure_fresh()
 
         pool = cache.get_filtered_questions(subject=subject)
         if not pool:
@@ -4649,8 +4795,7 @@ def get_daily_challenge(subject: str = "Physics", authorization: str = Header(No
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         user_id = payload.get("user_id")
 
-        if not cache.is_loaded:
-            cache.load_questions()
+        cache.ensure_fresh()
         pool = cache.get_filtered_questions(subject=subject)
         if not pool:
             raise HTTPException(status_code=400, detail=f"No questions found for subject {subject!r}")
@@ -6136,6 +6281,109 @@ def get_teacher_attempt_detail(attempt_id: int, authorization: str = Header(None
         raise
     except Exception as e:
         print(f"❌ Error in /api/teacher/attempts/{attempt_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.delete("/api/teacher/students/{user_id}")
+def delete_teacher_student(user_id: int, authorization: str = Header(None)):
+    """Permanently delete a student account and ALL of their data.
+
+    Removing the `users` row cascades to every child table
+    (quiz_attempts, streaks, rank_history, daily_challenges, user_rewards,
+    user_subject_ranks — all wired ON DELETE CASCADE), so this single DELETE
+    wipes the student's entire footprint. Irreversible.
+
+    Guards: teacher-only (is_teacher JWT claim); refuses to delete another
+    teacher account, and refuses to delete the caller's own account."""
+    payload = require_teacher(authorization)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, name, email, is_teacher FROM users WHERE id = %s",
+            (user_id,),
+        )
+        u = cursor.fetchone()
+        if not u:
+            raise HTTPException(status_code=404, detail="Student not found")
+        u_id, u_name, u_email, u_is_teacher = u
+        if u_is_teacher:
+            raise HTTPException(status_code=400, detail="Cannot delete a teacher account")
+        if int(u_id) == int(payload.get('user_id') or 0):
+            raise HTTPException(status_code=400, detail="You cannot delete your own account")
+
+        cursor.execute("DELETE FROM users WHERE id = %s", (u_id,))
+        conn.commit()
+        print(f"🗑️  Teacher {payload.get('email')} deleted student {u_email} (id={u_id})")
+        return {
+            "success": True,
+            "deleted": {"id": int(u_id), "name": u_name or "Student", "email": u_email},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error in DELETE /api/teacher/students/{user_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.post("/api/teacher/students/{user_id}/reset-password")
+def reset_teacher_student_password(user_id: int, authorization: str = Header(None)):
+    """Reset a student's password to the default (`DEFAULT_RESET_PASSWORD`).
+
+    Only the bcrypt hash of the default is stored; the plaintext default is
+    returned so the teacher can pass it on. The student can change it afterwards
+    from Settings. For a Google-only account (no prior password), this also
+    enables email+password login as a fallback.
+
+    Teacher-only; refuses to target another teacher account."""
+    payload = require_teacher(authorization)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, name, email, is_teacher, google_id, password_hash FROM users WHERE id = %s",
+            (user_id,),
+        )
+        u = cursor.fetchone()
+        if not u:
+            raise HTTPException(status_code=404, detail="Student not found")
+        u_id, u_name, u_email, u_is_teacher, u_google_id, u_pw_hash = u
+        if u_is_teacher:
+            raise HTTPException(status_code=400, detail="Cannot reset a teacher account's password here")
+
+        temp_password = DEFAULT_RESET_PASSWORD
+        new_hash = hash_password(temp_password)
+        cursor.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (new_hash, u_id),
+        )
+        conn.commit()
+        print(f"🔑 Teacher {payload.get('email')} reset password for student {u_email} (id={u_id})")
+
+        # A Google-only account had no password before; the temp password now
+        # also works as an email+password fallback. Flag it so the UI can note
+        # that the student normally signs in with Google.
+        google_only = bool(u_google_id) and not u_pw_hash
+        return {
+            "success": True,
+            "student": {"id": int(u_id), "name": u_name or "Student", "email": u_email},
+            "temp_password": temp_password,
+            "google_account": google_only,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error in POST /api/teacher/students/{user_id}/reset-password: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
