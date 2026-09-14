@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -76,11 +77,11 @@ MIN_LINES_PER_EXERCISE = 8
 # purpose: a student has one daily goal and one streak, whatever they revise.
 DAILY_TALLY_SUBJECT = "Physics"
 
-# Exam mode marks at the end and pays XP/gems/streak. Practice mode reveals
-# the answer line by line, so it is deliberately reward-free -- otherwise a
-# student could farm a perfect score by reading each answer as it appears.
-# Flip to True to pay out in practice mode too.
-REWARD_PRACTICE_MODE = False
+# XP/gems/streak come from the Daily Challenge only, exactly like physics:
+# the Practice section is unlimited (60 passages, replayable), so paying it
+# out would make XP farmable and would make the daily meaningless. Both
+# editing modes therefore report rewards of zero unless the attempt was
+# launched from the daily.
 
 MODE_EXAM = "exam"
 MODE_PRACTICE = "practice"
@@ -89,6 +90,10 @@ MODE_PRACTICE = "practice"
 # can tell an editing attempt from a physics quiz.
 QUIZ_TYPE_EXAM = "english_exam"
 QUIZ_TYPE_PRACTICE = "english_practice"
+QUIZ_TYPE_DAILY = "english_daily"      # launched from the Daily Challenge
+
+# Every editing attempt type, for the history / stats / dashboard queries.
+QUIZ_TYPES_ALL = (QUIZ_TYPE_EXAM, QUIZ_TYPE_PRACTICE, QUIZ_TYPE_DAILY)
 
 # Full names for the sheet's error codes -- shown to students in review and
 # used for the teacher's weak-spot breakdown.
@@ -304,6 +309,7 @@ class SubmittedLine(BaseModel):
 class EditingSubmitRequest(BaseModel):
     uid: str
     mode: str = MODE_EXAM              # 'exam' | 'practice'
+    daily: bool = False                # launched from the Daily Challenge
     time_spent_seconds: int = 0
     answers: List[SubmittedLine] = []
 
@@ -801,9 +807,9 @@ def list_exercises(authorization: str = Header(None)):
         try:
             cursor.execute(
                 "SELECT questions_data, score, total_questions, percentage, attempted_at "
-                "FROM quiz_attempts WHERE user_id = %s AND quiz_type IN (%s, %s) "
+                "FROM quiz_attempts WHERE user_id = %s AND quiz_type IN (%s, %s, %s) "
                 "ORDER BY attempted_at ASC",
-                (user_id, QUIZ_TYPE_EXAM, QUIZ_TYPE_PRACTICE),
+                (user_id, *QUIZ_TYPES_ALL),
             )
             for qd, score, total, pct, at in cursor.fetchall():
                 try:
@@ -882,7 +888,8 @@ def check_line(request: EditingCheckRequest, authorization: str = Header(None)):
 
 def _persist_attempt(cursor, conn, user_id: int, ex: EditingExercise,
                      results: List[Dict[str, Any]], summary: Dict[str, Any],
-                     mode: str, time_spent: int) -> Optional[int]:
+                     mode: str, time_spent: int,
+                     daily: bool = False) -> Optional[int]:
     """Save the attempt into quiz_attempts so it shows up in History and in
     the teacher dashboard alongside physics quizzes.
 
@@ -931,7 +938,10 @@ def _persist_attempt(cursor, conn, user_id: int, ex: EditingExercise,
             "mode": mode,
         })
 
-    quiz_type = QUIZ_TYPE_EXAM if mode == MODE_EXAM else QUIZ_TYPE_PRACTICE
+    if daily:
+        quiz_type = QUIZ_TYPE_DAILY
+    else:
+        quiz_type = QUIZ_TYPE_EXAM if mode == MODE_EXAM else QUIZ_TYPE_PRACTICE
     cursor.execute(
         "INSERT INTO quiz_attempts "
         "(user_id, name, difficulty, subtopic, score, percentage, total_questions, "
@@ -1081,6 +1091,7 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
         raise HTTPException(status_code=404, detail=f"No editing exercise {request.uid!r}")
 
     mode = MODE_PRACTICE if request.mode == MODE_PRACTICE else MODE_EXAM
+    is_daily = bool(request.daily)
     given = {a.line_no: a for a in request.answers}
     results = [
         grade_line(ln, given.get(ln.line_no, SubmittedLine(line_no=ln.line_no)))
@@ -1095,16 +1106,17 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
     try:
         try:
             attempt_id = _persist_attempt(cursor, conn, user_id, ex, results,
-                                          summary, mode, request.time_spent_seconds)
+                                          summary, mode, request.time_spent_seconds,
+                                          daily=is_daily)
         except Exception as exc:
             print(f"⚠️  Saving editing attempt failed (non-fatal): {exc}")
 
-        if mode == MODE_EXAM or REWARD_PRACTICE_MODE:
+        if is_daily:
             rewards = _award_rewards(cursor, conn, user_id, summary["score"],
                                      summary["total"], ex.difficulty)
         else:
-            # Practice mode is reward-free (it shows the answers line by
-            # line), but still report the balances so the UI stays accurate.
+            # The Practice section is reward-free in both modes, but still
+            # report the balances so the UI stays accurate.
             try:
                 cursor.execute("SELECT xp, gems FROM users WHERE id = %s", (user_id,))
                 row = cursor.fetchone()
@@ -1129,7 +1141,7 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
         "title": ex.title,
         "difficulty": ex.difficulty,
         "mode": mode,
-        "rewarded": mode == MODE_EXAM or REWARD_PRACTICE_MODE,
+        "rewarded": is_daily,
         "results": results,
         "trap_note": ex.trap_note,
         **summary,
@@ -1142,6 +1154,116 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
 # ENDPOINTS -- STATS, TEACHER, DIAGNOSTICS
 # ============================================================================
 
+@router.get("/daily")
+def english_daily(authorization: str = Header(None)):
+    """Today's editing passage for the Daily Challenge.
+
+    One passage is exactly ten marks, which is the daily target, so clearing
+    it clears the day. The pick is weighted toward the error codes the
+    student gets wrong most — the same idea as the physics daily weighting
+    toward weak topics — and seeded on (user, date) so it is the SAME
+    passage all day however many times they open the screen.
+    """
+    user_id = _auth_user_id(authorization)
+    exercises = bank.all()
+    if not exercises:
+        h = bank.health()
+        raise HTTPException(status_code=503,
+                            detail=f"Editing bank unavailable: {h['last_error'] or 'no exercises'}")
+
+    effective_today = _dep("effective_today")
+    today = effective_today(user_id)
+
+    attempted: set = set()
+    code_stats: Dict[str, List[int]] = {}          # code -> [correct, total]
+    daily = None
+
+    conn = _dep("get_db_connection")()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT questions_data FROM quiz_attempts "
+            "WHERE user_id = %s AND quiz_type IN (%s, %s, %s) "
+            "ORDER BY attempted_at DESC LIMIT 200",
+            (user_id, *QUIZ_TYPES_ALL),
+        )
+        for (blob,) in cursor.fetchall():
+            try:
+                rows = json.loads(blob) if blob else []
+            except Exception:
+                continue
+            if not rows:
+                continue
+            if rows[0].get("exercise_uid"):
+                attempted.add(rows[0]["exercise_uid"])
+            for row in rows:
+                code = row.get("error_code") or ""
+                if not code:
+                    continue
+                slot = code_stats.setdefault(code, [0, 0])
+                slot[1] += 1
+                slot[0] += int(bool(row.get("is_correct")))
+
+        # Today's shared tally — English and physics both credit this row.
+        cursor.execute(
+            "SELECT score, total, passed FROM daily_challenges "
+            "WHERE user_id = %s AND subject = %s AND challenge_date = %s",
+            (user_id, DAILY_TALLY_SUBJECT, today),
+        )
+        row = cursor.fetchone()
+        if row:
+            daily = {"today_correct": int(row[0] or 0),
+                     "today_total": int(row[1] or 0),
+                     "passed_today": bool(row[2])}
+    except Exception as exc:
+        print(f"\u26a0\ufe0f  Editing daily lookup failed (non-fatal): {exc}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    target = _D.get("constants", {}).get("DAILY_CORRECT_TARGET", 10)
+    if daily is None:
+        daily = {"today_correct": 0, "today_total": 0, "passed_today": False}
+    daily["target"] = target
+
+    def code_weight(code: str) -> int:
+        """Weaker code -> heavier. Unseen codes get moderate coverage, so a
+        new student still meets a spread rather than the same few."""
+        correct, total = code_stats.get(code, (0, 0))
+        if not total:
+            return 40
+        return max(5, 100 - round(100 * correct / total))
+
+    # Unseen passages first; once they've all been done, the whole bank is
+    # back in play rather than the daily running dry.
+    pool = [ex for ex in exercises if ex.uid not in attempted] or exercises
+    weights = [
+        max(1, sum(code_weight(ln.error_code) for ln in ex.lines if ln.error_code))
+        for ex in pool
+    ]
+
+    # Seeded on user + date: the same passage all day, a different one
+    # tomorrow, and not the same passage for everyone.
+    rng = random.Random(f"{user_id}-{today.isoformat()}")
+    chosen = rng.choices(pool, weights=weights, k=1)[0]
+
+    weakest = sorted(
+        ({"code": c, "name": ERROR_CODES.get(c, {}).get("name", c),
+          "accuracy": round(100 * v[0] / v[1])} for c, v in code_stats.items() if v[1]),
+        key=lambda x: x["accuracy"],
+    )[:2]
+
+    return {
+        "uid": chosen.uid,
+        "title": chosen.title,
+        "difficulty": chosen.difficulty,
+        "total_marks": chosen.total_marks,
+        "already_attempted": chosen.uid in attempted,
+        "daily_progress": daily,
+        "focus": weakest,            # what this pick is aimed at, for the UI
+    }
+
+
 @router.get("/stats")
 def my_stats(authorization: str = Header(None)):
     """This student's editing record, broken down by error type."""
@@ -1151,8 +1273,8 @@ def my_stats(authorization: str = Header(None)):
     try:
         cursor.execute(
             "SELECT questions_data FROM quiz_attempts "
-            "WHERE user_id = %s AND quiz_type IN (%s, %s) ORDER BY attempted_at DESC LIMIT 200",
-            (user_id, QUIZ_TYPE_EXAM, QUIZ_TYPE_PRACTICE),
+            "WHERE user_id = %s AND quiz_type IN (%s, %s, %s) ORDER BY attempted_at DESC LIMIT 200",
+            (user_id, *QUIZ_TYPES_ALL),
         )
         by_code: Dict[str, Dict[str, int]] = {}
         misses: Dict[str, int] = {}
@@ -1214,10 +1336,10 @@ def teacher_overview(days: int = 30, authorization: str = Header(None)):
             "SELECT qa.user_id, u.name, qa.questions_data, qa.score, qa.total_questions, "
             "       qa.percentage, qa.attempted_at "
             "FROM quiz_attempts qa JOIN users u ON u.id = qa.user_id "
-            "WHERE qa.quiz_type IN (%s, %s) "
+            "WHERE qa.quiz_type IN (%s, %s, %s) "
             "  AND qa.attempted_at >= DATE_SUB(NOW(), INTERVAL %s DAY) "
             "ORDER BY qa.attempted_at DESC",
-            (QUIZ_TYPE_EXAM, QUIZ_TYPE_PRACTICE, max(1, int(days))),
+            (*QUIZ_TYPES_ALL, max(1, int(days))),
         )
         rows = cursor.fetchall()
     finally:
