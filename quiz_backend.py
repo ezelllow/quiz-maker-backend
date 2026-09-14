@@ -1694,6 +1694,83 @@ def admin_refresh(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Reload failed: {e}")
 
+
+@app.get("/api/admin/broken-images")
+def admin_broken_images(
+    authorization: str = Header(None),
+    x_refresh_key: str = Header(None),
+    key: Optional[str] = None,
+):
+    """Report questions whose diagram / options image does NOT resolve to a
+    Google Drive file (i.e. would 404 for a student).
+
+    A reference resolves if it matches a name in the Drive file_map — exactly,
+    with a common image extension, or as a name prefix (same lookup the image
+    proxy uses) — or if it looks like a real Drive file ID. Real IDs are not
+    round-tripped to Drive here (that would cost one API call per image); this
+    catches the common case of a filename/UID with no matching Drive file.
+
+    Auth: a teacher JWT (Authorization: Bearer ...), OR — if ADMIN_REFRESH_KEY
+    is set — a matching ?key= param / X-Refresh-Key header (for a scheduled
+    job without a login).
+    """
+    provided_key = (key or x_refresh_key or '').strip()
+    if ADMIN_REFRESH_KEY and provided_key == ADMIN_REFRESH_KEY:
+        pass  # shared-secret auth OK
+    else:
+        require_teacher(authorization)
+
+    cache.ensure_fresh()
+    if not cache.file_map:
+        cache.load_file_map()
+    fm = cache.file_map or {}
+
+    _EXTS = ('', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.PNG', '.JPG')
+
+    def resolves(ref: str) -> bool:
+        if not ref:
+            return True  # nothing to resolve for this reference
+        candidates = [ref, ref.lower()]
+        for ext in _EXTS:
+            for base in candidates:
+                if base + ext in fm:
+                    return True
+        if len(ref) >= 6:
+            pl = ref.lower()
+            if any(k.startswith(pl) for k in fm):
+                return True
+        # Looks like a real Drive file ID (long, no spaces/slashes) — assume ok
+        if len(ref) >= 25 and '/' not in ref and ' ' not in ref:
+            return True
+        return False
+
+    broken = []
+    for q in cache.questions:
+        refs = []
+        d = getattr(q, 'diagram_file_id', None)
+        o = getattr(q, 'options_image_uid', None)
+        if d:
+            refs.append(('setup_diagram', d))
+        if o:
+            refs.append(('options_image', o))
+        for kind, ref in refs:
+            if not resolves(ref):
+                broken.append({
+                    'subject': getattr(q, 'subject', None),
+                    'level': getattr(q, 'level', None),
+                    'difficulty': getattr(q, 'difficulty', None),
+                    'kind': kind,
+                    'reference': ref,
+                    'question_preview': (getattr(q, 'question_text', '') or '')[:80],
+                })
+
+    return {
+        'checked_questions': len(cache.questions),
+        'file_map_size': len(fm),
+        'broken_count': len(broken),
+        'broken': broken,
+    }
+
 # 6091 Physics (O-Level) syllabus topic sequences. Pure and Combined physics
 # have different topic sets / orders; these drive the build-form filter order.
 PURE_TOPIC_ORDER = [
@@ -3412,6 +3489,9 @@ def get_quiz_history(
                 # predate the daily feature, so they count as practice.
                 sql += " AND parent_attempt_id IS NULL"
                 sql += " AND (quiz_type IS NULL OR quiz_type <> 'daily')"
+                # English editing attempts live in their own hub and cannot be
+                # replayed by QuizMaker, so they never belong in Saved Quizzes.
+                sql += " AND (quiz_type IS NULL OR quiz_type NOT LIKE 'english%')"
             sql += " ORDER BY attempted_at DESC"
 
             cursor.execute(sql, (user_id,))
@@ -6388,6 +6468,44 @@ def reset_teacher_student_password(user_id: int, authorization: str = Header(Non
     finally:
         cursor.close()
         conn.close()
+
+
+# ============================================================================
+# ENGLISH — EDITING PRACTICE
+# ============================================================================
+# Lives in its own module (english_editing.py) because it is a different
+# question type with its own sheet, its own marking rules and its own review
+# screen. It borrows this file's Google client, DB pool, JWT check and the
+# XP/streak/gem economy through init() rather than importing quiz_backend
+# (which would be circular). A failure here must never stop physics loading.
+try:
+    import english_editing
+
+    english_editing.init(
+        get_sheets_service=get_sheets_service,
+        get_db_connection=get_db_connection,
+        verify_jwt_token=verify_jwt_token,
+        require_teacher=require_teacher,
+        xp_for_quiz=xp_for_quiz,
+        gems_for_quiz=gems_for_quiz,
+        compute_rank=compute_rank,
+        compute_progression=compute_progression,
+        credit_daily_practice=_credit_daily_practice,
+        award_streak_day=_award_streak_day,
+        effective_today=_effective_today,
+        constants={
+            "DAILY_CORRECT_TARGET":   DAILY_CORRECT_TARGET,
+            "XP_BONUS_DAILY_GOAL":    XP_BONUS_DAILY_GOAL,
+            "XP_BONUS_STREAK_AMOUNT": XP_BONUS_STREAK_AMOUNT,
+            "XP_BONUS_STREAK_EVERY":  XP_BONUS_STREAK_EVERY,
+        },
+    )
+    app.include_router(english_editing.router)
+    ENGLISH_EDITING_ENABLED = True
+    print("\u270f\ufe0f  English editing module mounted at /api/english")
+except Exception as _ee:
+    ENGLISH_EDITING_ENABLED = False
+    print(f"\u26a0\ufe0f  English editing module not mounted: {_ee}")
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
