@@ -1154,15 +1154,42 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
 # ENDPOINTS -- STATS, TEACHER, DIAGNOSTICS
 # ============================================================================
 
+def _difficulty_multipliers(levels: List[str]) -> Dict[str, float]:
+    """What each level multiplies XP by, straight from the scorer.
+
+    One correct answer out of one is the cheapest probe that makes
+    xp_for_quiz report its multiplier, and asking it beats copying the table:
+    a UI badge that disagrees with the payout is worse than no badge.
+    """
+    out: Dict[str, float] = {}
+    try:
+        xp_for_quiz = _dep("xp_for_quiz")
+    except Exception:
+        return out
+    for level in levels:
+        try:
+            out[level] = float(xp_for_quiz(1, 1, level).get("diff_mult", 1.0))
+        except Exception:
+            continue
+    return out
+
+
 @router.get("/daily")
-def english_daily(authorization: str = Header(None)):
+def english_daily(difficulty: Optional[str] = None, authorization: str = Header(None)):
     """Today's editing passage for the Daily Challenge.
 
     One passage is exactly ten marks, which is the daily target, so clearing
     it clears the day. The pick is weighted toward the error codes the
     student gets wrong most — the same idea as the physics daily weighting
-    toward weak topics — and seeded on (user, date) so it is the SAME
-    passage all day however many times they open the screen.
+    toward weak topics — and seeded on (user, date, difficulty) so it is the
+    SAME passage all day however many times they open the screen, while
+    still giving a different one per difficulty rather than the same passage
+    relabelled.
+
+    `difficulty` narrows the pool the way the physics daily's difficulty
+    picker does; omitted (or unrecognised) means the whole bank. It is
+    matched case-insensitively so the query string doesn't have to know how
+    the sheet capitalises its levels.
     """
     user_id = _auth_user_id(authorization)
     exercises = bank.all()
@@ -1234,17 +1261,26 @@ def english_daily(authorization: str = Header(None)):
             return 40
         return max(5, 100 - round(100 * correct / total))
 
-    # Unseen passages first; once they've all been done, the whole bank is
-    # back in play rather than the daily running dry.
-    pool = [ex for ex in exercises if ex.uid not in attempted] or exercises
+    # Narrow to the chosen level first, so "unseen" and the weighting below
+    # both mean "within this difficulty". An unknown level is ignored rather
+    # than fatal: a passage at the wrong level beats no daily at all.
+    wanted = (difficulty or "").strip().lower()
+    levels = sorted({ex.difficulty for ex in exercises})
+    at_level = [ex for ex in exercises if ex.difficulty.lower() == wanted] if wanted else []
+    in_scope = at_level or exercises
+
+    # Unseen passages first; once they've all been done, the level is back in
+    # play rather than the daily running dry.
+    pool = [ex for ex in in_scope if ex.uid not in attempted] or in_scope
     weights = [
         max(1, sum(code_weight(ln.error_code) for ln in ex.lines if ln.error_code))
         for ex in pool
     ]
 
-    # Seeded on user + date: the same passage all day, a different one
-    # tomorrow, and not the same passage for everyone.
-    rng = random.Random(f"{user_id}-{today.isoformat()}")
+    # Seeded on user + date + level: the same passage all day, a different
+    # one tomorrow, not the same passage for everyone, and switching level
+    # gives a genuinely different passage rather than a reshuffle.
+    rng = random.Random(f"{user_id}-{today.isoformat()}-{wanted}")
     chosen = rng.choices(pool, weights=weights, k=1)[0]
 
     weakest = sorted(
@@ -1261,6 +1297,14 @@ def english_daily(authorization: str = Header(None)):
         "already_attempted": chosen.uid in attempted,
         "daily_progress": daily,
         "focus": weakest,            # what this pick is aimed at, for the UI
+        "difficulties": levels,      # what the picker may offer
+        # Asked of the scorer itself rather than restated here, so the badge
+        # on the picker can't drift away from what the level actually pays.
+        "difficulty_multipliers": _difficulty_multipliers(levels),
+        # What was actually honoured — the UI says so when a level had
+        # nothing in it and the pick fell back to the whole bank.
+        "requested_difficulty": difficulty or None,
+        "difficulty_applied": bool(at_level),
     }
 
 
