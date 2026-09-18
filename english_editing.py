@@ -12,7 +12,9 @@ Singapore secondary-school English papers:
 Source of truth is a Google Sheet (one row per line) with columns:
 
     UID | Exercise | Difficulty | Question Text | Line # | Line Text |
-    Incorrect Word | Correct Word | Error Code | Explanation | Trap Note
+    Incorrect Word | Correct Word | Error Code | Explanation
+
+Any other column in the sheet is ignored.
 
 The FIRST row of each UID group is the exercise header: it carries the
 title, the difficulty and the full passage in `Question Text`. The rows
@@ -290,7 +292,6 @@ class EditingExercise(BaseModel):
     passage: str
     intro_line: str = ""       # unnumbered opening line -- always correct
     outro_line: str = ""       # unnumbered closing line -- always correct
-    trap_note: str = ""        # teacher-facing note from the sheet
     lines: List[EditingLineAnswer] = []
 
     @property
@@ -340,7 +341,6 @@ _COLUMN_ALIASES = {
     "correct_word":   ("correct word", "answer", "correction", "correct"),
     "error_code":     ("error code", "code", "error type", "type"),
     "explanation":    ("explanation", "reason", "why"),
-    "trap_note":      ("trap note", "trap", "teacher note", "note"),
 }
 
 
@@ -365,19 +365,6 @@ def _cell(row: List[str], col: Dict[str, int], field: str) -> str:
     if idx is None or idx >= len(row):
         return ""
     return str(row[idx] or "").strip()
-
-
-def _clean_trap(note: str) -> str:
-    """Strip the sheet's own label off a trap note.
-
-    The column's text usually opens with "Trap to teach" (sometimes followed
-    by "Trap:"), which the UI already says above it — leaving it in reads as
-    "The trap in this one: Trap to teach Trap: ...".
-    """
-    text = re.sub(r"\s+", " ", (note or "")).strip()
-    text = re.sub(r"^trap\s+to\s+teach\b[\s:\u2013\u2014-]*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^trap\b[\s:\u2013\u2014-]*", "", text, flags=re.IGNORECASE)
-    return text.strip()
 
 
 def _split_passage(passage: str, line_texts: List[str]) -> Dict[str, str]:
@@ -499,10 +486,6 @@ class EditingBank:
             title = next((_cell(r, col, "title") for r in group if _cell(r, col, "title")), "")
             difficulty = next((_cell(r, col, "difficulty") for r in group if _cell(r, col, "difficulty")), "")
             passage = next((_cell(r, col, "passage") for r in group if _cell(r, col, "passage")), "")
-            trap = _clean_trap(
-                next((_cell(r, col, "trap_note") for r in group if _cell(r, col, "trap_note")), "")
-            )
-
             line_rows = []
             for r in group:
                 raw_no = _cell(r, col, "line_no")
@@ -574,7 +557,6 @@ class EditingBank:
                 passage=passage,
                 intro_line=split["intro"],
                 outro_line=split["outro"],
-                trap_note=trap,
                 lines=lines,
             )
             kept_order.append(uid)
@@ -1143,7 +1125,6 @@ def submit_exercise(request: EditingSubmitRequest, authorization: str = Header(N
         "mode": mode,
         "rewarded": is_daily,
         "results": results,
-        "trap_note": ex.trap_note,
         **summary,
         **rewards,
         "progression": _dep("compute_progression")(xp_total),
