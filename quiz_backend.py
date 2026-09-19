@@ -867,13 +867,33 @@ def init_database():
                 content_ref VARCHAR(100) NULL,
                 attempt_id INT NULL,
                 screen VARCHAR(50) NULL,
+                category VARCHAR(50) NULL,
                 message TEXT NOT NULL,
+                image MEDIUMBLOB NULL,
+                image_mime VARCHAR(50) NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 INDEX idx_reports_created (created_at),
                 INDEX idx_reports_uid (content_uid)
             )
         """)
+
+        # reports gained category + image after first release; add them to
+        # any table that already exists, the way is_teacher and xp are handled.
+        for _col, _ddl in (
+            ("category",   "ADD COLUMN category VARCHAR(50) NULL AFTER screen"),
+            ("image",      "ADD COLUMN image MEDIUMBLOB NULL AFTER message"),
+            ("image_mime", "ADD COLUMN image_mime VARCHAR(50) NULL AFTER image"),
+        ):
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'reports'
+                  AND COLUMN_NAME = %s
+            """, (_col,))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(f"ALTER TABLE reports {_ddl}")
+                print(f"🔧 Added {_col} column to reports")
 
         # Create user_subject_ranks table (Phase 1 ranking system)
         cursor.execute("""
@@ -6548,6 +6568,60 @@ TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 REPORT_WEBHOOK_URL = os.getenv('REPORT_WEBHOOK_URL', '').strip()
 
 REPORT_MAX_CHARS = 1000
+
+# What a student can pick from. The list is short on purpose: a picker only
+# speeds up triage while every option is worth its own reaction, and "Other"
+# is what stops a long tail of near-duplicates from being invented.
+REPORT_CATEGORIES = [
+    "Wrong answer",
+    "Question unclear",
+    "Typo",
+    "Picture missing",
+    "Won't load",
+    "Other",
+]
+
+# Images arrive downscaled by the browser (see ReportButton). This is the
+# backstop for anything that doesn't — a phone screenshot is several MB raw,
+# and MySQL's max_allowed_packet is commonly 4MB, so an un-shrunk upload
+# would fail at the driver rather than anywhere we could explain it.
+REPORT_MAX_IMAGE_BYTES = 1_500_000
+
+# Magic bytes, because a MIME type in a request body is a claim, not a fact.
+_IMAGE_SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _decode_report_image(data_url: Optional[str]):
+    """Turn the client's data: URL into (bytes, mime), or (None, None).
+
+    Raises HTTPException on anything present but unusable, so a student who
+    attached a photo is told it didn't go rather than quietly filing without
+    the one thing they wanted us to see.
+    """
+    import base64 as _b64
+
+    if not data_url:
+        return None, None
+    raw = data_url.strip()
+    if "," in raw and raw[:5].lower() == "data:":
+        raw = raw.split(",", 1)[1]
+    try:
+        blob = _b64.b64decode(raw, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="That image could not be read")
+    if not blob:
+        return None, None
+    if len(blob) > REPORT_MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="That image is too big — try a smaller one")
+    for sig, mime in _IMAGE_SIGNATURES:
+        if blob.startswith(sig):
+            return blob, mime
+    raise HTTPException(status_code=400, detail="That file doesn't look like an image")
 # Telegram rejects anything over 4096; ours are capped well under that, but a
 # rejected send would be a silently lost nudge, so clamp rather than trust.
 TELEGRAM_MAX_CHARS = 4000
@@ -6611,7 +6685,9 @@ class ReportRequest(BaseModel):
     to explain WHICH question they mean — which is the half of a bug report
     they always get wrong and we can't recover afterwards.
     """
-    message: str
+    message: str = ""
+    category: Optional[str] = None      # one of REPORT_CATEGORIES
+    image: Optional[str] = None         # data: URL, already downscaled
     subject: Optional[str] = None       # 'Physics' | 'English' | ...
     content_uid: Optional[str] = None   # the Sheet UID -> the row to fix
     content_ref: Optional[str] = None   # 'Q4', 'line 7' — within that row
@@ -6626,10 +6702,25 @@ def notify_report(report_id: int, who: str, req: "ReportRequest") -> None:
     try:
         where = " · ".join(x for x in (req.content_uid, req.content_ref, req.subject) if x)
         body = f"🐞 Report #{report_id}" + (f" — {where}" if where else "")
-        body += f"\n{(req.message or '').strip()}\n— {who}"
+        if req.category:
+            body += f"\n[{req.category}]"
+        text = (req.message or "").strip()
+        if text:
+            body += f"\n{text}"
+        if req.image:
+            body += "\n📷 photo attached — see the dashboard"
+        body += f"\n— {who}"
         notify_text(body)
     except Exception as exc:
         print(f"⚠️  Report notification failed (non-fatal): {exc}")
+
+
+@app.get("/api/reports/categories")
+def report_categories():
+    """The issue list the report form offers. Served rather than hardcoded in
+    the app, so the two can't drift into disagreeing about what a valid
+    category is — the POST validates against this same list."""
+    return {"categories": REPORT_CATEGORIES}
 
 
 @app.post("/api/reports")
@@ -6644,7 +6735,13 @@ def create_report(request: ReportRequest, background: BackgroundTasks,
     user_id = payload.get('user_id')
 
     message = (request.message or "").strip()[:REPORT_MAX_CHARS]
-    if not message:
+    category = request.category if request.category in REPORT_CATEGORIES else None
+    blob, mime = _decode_report_image(request.image)
+
+    # A picked issue or an attached photo is a report on its own — "Picture
+    # missing" plus a screenshot says everything. Only a wholly empty one is
+    # refused.
+    if not message and not category and blob is None:
         raise HTTPException(status_code=400, detail="Tell us what looks wrong")
 
     conn = get_db_connection()
@@ -6652,10 +6749,11 @@ def create_report(request: ReportRequest, background: BackgroundTasks,
     try:
         cursor.execute(
             "INSERT INTO reports "
-            "(user_id, subject, content_uid, content_ref, attempt_id, screen, message) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            "(user_id, subject, content_uid, content_ref, attempt_id, screen, "
+            " category, message, image, image_mime) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (user_id, request.subject, request.content_uid, request.content_ref,
-             request.attempt_id, request.screen, message),
+             request.attempt_id, request.screen, category, message, blob, mime),
         )
         conn.commit()
         report_id = cursor.lastrowid
@@ -6680,7 +6778,8 @@ def list_reports(authorization: str = Header(None), limit: int = 100):
     try:
         cursor.execute(
             "SELECT r.id, r.subject, r.content_uid, r.content_ref, r.attempt_id, "
-            "       r.screen, r.message, r.created_at, u.name, u.student_class "
+            "       r.screen, r.message, r.created_at, u.name, u.student_class, "
+            "       r.category, r.image IS NOT NULL "
             "FROM reports r JOIN users u ON u.id = r.user_id "
             "ORDER BY r.created_at DESC LIMIT %s",
             (max(1, min(int(limit or 100), 500)),),
@@ -6690,11 +6789,32 @@ def list_reports(authorization: str = Header(None), limit: int = 100):
         cursor.close()
         conn.close()
 
+    # The image is deliberately NOT inlined: a list of base64 screenshots is
+    # megabytes of response nobody has looked at yet. It's fetched on demand
+    # from the endpoint below.
     return {"reports": [{
         "id": r[0], "subject": r[1], "content_uid": r[2], "content_ref": r[3],
         "attempt_id": r[4], "screen": r[5], "message": r[6],
         "created_at": str(r[7]), "student": r[8], "student_class": r[9],
+        "category": r[10], "has_image": bool(r[11]),
     } for r in rows]}
+
+
+@app.get("/api/teacher/reports/{report_id}/image")
+def get_report_image(report_id: int, authorization: str = Header(None)):
+    """The photo attached to one report."""
+    require_teacher(authorization)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT image, image_mime FROM reports WHERE id = %s", (report_id,))
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="No image on that report")
+    return Response(content=bytes(row[0]), media_type=row[1] or "image/jpeg")
 
 
 @app.post("/api/teacher/reports/test-notify")
