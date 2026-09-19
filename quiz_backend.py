@@ -6644,6 +6644,49 @@ def _post_json(url: str, payload: dict) -> None:
         pass
 
 
+# sendPhoto captions are capped at 1024 — shorter than a report may be, so
+# the caption is trimmed and the full text follows as its own message rather
+# than being silently cut by Telegram.
+TELEGRAM_CAPTION_MAX = 1024
+
+
+def _send_telegram_photo(caption: str, blob: bytes, mime: str) -> None:
+    """Upload the attached photo with the report as its caption.
+
+    multipart/form-data hand-rolled because sendPhoto needs a file part and
+    the stdlib has no multipart encoder — still better than taking on a
+    dependency for one call.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    boundary = f"----ooka{_uuid.uuid4().hex}"
+    ext = {"image/png": "png", "image/gif": "gif"}.get(mime, "jpg")
+    dash = f"--{boundary}\r\n".encode()
+
+    def field(name: str, value: str) -> bytes:
+        return (dash
+                + f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+                + value.encode("utf-8") + b"\r\n")
+
+    body = (
+        field("chat_id", TELEGRAM_CHAT_ID)
+        + field("caption", caption[:TELEGRAM_CAPTION_MAX])
+        + dash
+        + f'Content-Disposition: form-data; name="photo"; filename="report.{ext}"\r\n'.encode()
+        + f"Content-Type: {mime}\r\n\r\n".encode()
+        + blob + b"\r\n"
+        + f"--{boundary}--\r\n".encode()
+    )
+    post = _urlreq.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+        data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with _urlreq.urlopen(post, timeout=15):
+        pass
+
+
 def _send_telegram(text: str) -> None:
     """One message to the configured chat.
 
@@ -6660,15 +6703,27 @@ def _send_telegram(text: str) -> None:
     )
 
 
-def notify_text(text: str) -> bool:
+def notify_text(text: str, image: Optional[bytes] = None,
+                image_mime: Optional[str] = None) -> bool:
     """Send a notification wherever this deployment is pointed.
+
+    With a photo, Telegram gets it inline — most reports are "look at this",
+    and a notification you can act on from the lock screen beats one that
+    tells you to go and open a dashboard.
 
     Returns whether anything was configured to send. Raises on a transport
     failure so the caller can decide — notify_report swallows, the teacher's
     test endpoint reports it.
     """
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        _send_telegram(text)
+        if image:
+            _send_telegram_photo(text, image, image_mime or "image/jpeg")
+            # The caption is capped well below what a report may run to, so
+            # send the rest separately rather than let Telegram truncate it.
+            if len(text) > TELEGRAM_CAPTION_MAX:
+                _send_telegram(text)
+        else:
+            _send_telegram(text)
         return True
     if REPORT_WEBHOOK_URL:
         # Discord reads "content", Slack reads "text"; sending both means one
@@ -6695,7 +6750,9 @@ class ReportRequest(BaseModel):
     screen: Optional[str] = None        # 'quiz' | 'review' — where they were
 
 
-def notify_report(report_id: int, who: str, req: "ReportRequest") -> None:
+def notify_report(report_id: int, who: str, req: "ReportRequest",
+                  image: Optional[bytes] = None,
+                  image_mime: Optional[str] = None) -> None:
     """Best-effort ping. Runs in a background task AFTER the row is committed,
     and swallows everything: a student's report must succeed even when the
     notifier is down, and the row is already safe either way."""
@@ -6707,10 +6764,8 @@ def notify_report(report_id: int, who: str, req: "ReportRequest") -> None:
         text = (req.message or "").strip()
         if text:
             body += f"\n{text}"
-        if req.image:
-            body += "\n📷 photo attached — see the dashboard"
         body += f"\n— {who}"
-        notify_text(body)
+        notify_text(body, image, image_mime)
     except Exception as exc:
         print(f"⚠️  Report notification failed (non-fatal): {exc}")
 
@@ -6765,7 +6820,7 @@ def create_report(request: ReportRequest, background: BackgroundTasks,
         conn.close()
 
     # Only once the row is safely committed.
-    background.add_task(notify_report, report_id, who, request)
+    background.add_task(notify_report, report_id, who, request, blob, mime)
     return {"success": True, "id": report_id}
 
 
