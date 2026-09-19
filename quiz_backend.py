@@ -11,7 +11,7 @@ import time
 from typing import List, Optional, Tuple, Dict
 from collections import defaultdict, OrderedDict
 import threading
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
@@ -850,6 +850,30 @@ def init_database():
         if cursor.fetchone()[0] == 0:
             cursor.execute("ALTER TABLE daily_challenges ADD COLUMN xp BIGINT NOT NULL DEFAULT 0 AFTER attempts")
             print("🔧 Added xp column to daily_challenges")
+
+        # Fault reports from students. The point of the table is the CONTENT
+        # IDENTITY: content_uid is the Sheet's UID for the question or editing
+        # passage, so a report leads straight to the row to fix. A report with
+        # a good description but no uid is nearly useless.
+        #
+        # No status column and no rate limiting on purpose — at this size the
+        # workflow is read it, fix the Sheet, delete the row.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                subject VARCHAR(100) NULL,
+                content_uid VARCHAR(100) NULL,
+                content_ref VARCHAR(100) NULL,
+                attempt_id INT NULL,
+                screen VARCHAR(50) NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                INDEX idx_reports_created (created_at),
+                INDEX idx_reports_uid (content_uid)
+            )
+        """)
 
         # Create user_subject_ranks table (Phase 1 ranking system)
         cursor.execute("""
@@ -6506,6 +6530,143 @@ try:
 except Exception as _ee:
     ENGLISH_EDITING_ENABLED = False
     print(f"\u26a0\ufe0f  English editing module not mounted: {_ee}")
+
+
+# ============================================================================
+# FAULT REPORTS
+# ============================================================================
+
+# Optional. Set to a Discord / Slack incoming-webhook URL (or any endpoint
+# that accepts {"content": "..."}) to be told when a report lands. Left unset,
+# reports are simply stored — which is the point: the row is the record, the
+# notification is a nudge, and losing the nudge loses nothing.
+REPORT_WEBHOOK_URL = os.getenv('REPORT_WEBHOOK_URL', '').strip()
+
+REPORT_MAX_CHARS = 1000
+
+
+class ReportRequest(BaseModel):
+    """What the student is looking at when they hit the flag.
+
+    Everything but `message` is filled in by the app, so the student never has
+    to explain WHICH question they mean — which is the half of a bug report
+    they always get wrong and we can't recover afterwards.
+    """
+    message: str
+    subject: Optional[str] = None       # 'Physics' | 'English' | ...
+    content_uid: Optional[str] = None   # the Sheet UID -> the row to fix
+    content_ref: Optional[str] = None   # 'Q4', 'line 7' — within that row
+    attempt_id: Optional[int] = None
+    screen: Optional[str] = None        # 'quiz' | 'review' — where they were
+
+
+def notify_report(report_id: int, who: str, req: "ReportRequest") -> None:
+    """Best-effort ping. Runs in a background task AFTER the row is committed,
+    swallows everything: a student's report must succeed even when the
+    webhook is down, and the row is already safe either way."""
+    if not REPORT_WEBHOOK_URL:
+        return
+    try:
+        # urllib, not `requests`: the module-level `requests` in this file is
+        # google.auth.transport.requests, and the HTTP library is only a
+        # transitive dependency (not in requirements.txt). stdlib avoids both.
+        import json as _json
+        import urllib.request as _urlreq
+
+        where = " · ".join(x for x in (req.content_uid, req.content_ref, req.subject) if x)
+        body = f"🐞 Report #{report_id}" + (f" — {where}" if where else "")
+        body += f"\n{(req.message or '').strip()}\n— {who}"
+        payload = _json.dumps({"content": body, "text": body}).encode("utf-8")
+        post = _urlreq.Request(REPORT_WEBHOOK_URL, data=payload, method="POST",
+                               headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(post, timeout=5):
+            pass
+    except Exception as exc:
+        print(f"⚠️  Report webhook failed (non-fatal): {exc}")
+
+
+@app.post("/api/reports")
+def create_report(request: ReportRequest, background: BackgroundTasks,
+                  authorization: str = Header(None)):
+    """File a fault report. Any signed-in student may report."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="No authorization token")
+    payload = verify_jwt_token(authorization.replace("Bearer ", ""))
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = payload.get('user_id')
+
+    message = (request.message or "").strip()[:REPORT_MAX_CHARS]
+    if not message:
+        raise HTTPException(status_code=400, detail="Tell us what looks wrong")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO reports "
+            "(user_id, subject, content_uid, content_ref, attempt_id, screen, message) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (user_id, request.subject, request.content_uid, request.content_ref,
+             request.attempt_id, request.screen, message),
+        )
+        conn.commit()
+        report_id = cursor.lastrowid
+        cursor.execute("SELECT name, student_class FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        who = f"{row[0]} ({row[1]})" if row and row[1] else (row[0] if row else f"user {user_id}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    # Only once the row is safely committed.
+    background.add_task(notify_report, report_id, who, request)
+    return {"success": True, "id": report_id}
+
+
+@app.get("/api/teacher/reports")
+def list_reports(authorization: str = Header(None), limit: int = 100):
+    """Every report, newest first."""
+    require_teacher(authorization)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT r.id, r.subject, r.content_uid, r.content_ref, r.attempt_id, "
+            "       r.screen, r.message, r.created_at, u.name, u.student_class "
+            "FROM reports r JOIN users u ON u.id = r.user_id "
+            "ORDER BY r.created_at DESC LIMIT %s",
+            (max(1, min(int(limit or 100), 500)),),
+        )
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {"reports": [{
+        "id": r[0], "subject": r[1], "content_uid": r[2], "content_ref": r[3],
+        "attempt_id": r[4], "screen": r[5], "message": r[6],
+        "created_at": str(r[7]), "student": r[8], "student_class": r[9],
+    } for r in rows]}
+
+
+@app.delete("/api/teacher/reports/{report_id}")
+def delete_report(report_id: int, authorization: str = Header(None)):
+    """Dismiss a report. Deleting IS the workflow here: read it, fix the
+    Sheet, drop the row. No status column to keep in step."""
+    require_teacher(authorization)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM reports WHERE id = %s", (report_id,))
+        conn.commit()
+        gone = cursor.rowcount
+    finally:
+        cursor.close()
+        conn.close()
+    if not gone:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {"success": True}
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
