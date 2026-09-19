@@ -105,7 +105,18 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'quiz_maker'),
     'port': int(os.getenv('DB_PORT', '3306')),
+    # Bounded, so a provider that accepts the socket and then stalls fails
+    # fast enough to be retried instead of holding a worker open.
+    'connect_timeout': int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
 }
+
+# Opening a connection can fail transiently — a managed MySQL that is at its
+# connection limit, throttling, or mid-failover drops the handshake and
+# pymysql reports (2013, 'Lost connection to MySQL server during query') from
+# connect() itself, not from any query. One retry turns most of those into a
+# short pause instead of a 500 for the student.
+DB_CONNECT_ATTEMPTS = int(os.getenv('DB_CONNECT_ATTEMPTS', '3'))
+DB_CONNECT_BACKOFF = float(os.getenv('DB_CONNECT_BACKOFF', '0.25'))
 
 # Public base URL — used to build absolute image URLs returned to the frontend.
 # In dev: defaults to http://localhost:8000. In production set to your Render URL.
@@ -542,10 +553,23 @@ def get_db_connection():
             raw = None
 
     if raw is None:
-        try:
-            raw = pymysql.connect(**DB_CONFIG)
-        except Exception as e:
-            print(f"❌ Database connection error: {e}")
+        last_error = None
+        for attempt in range(max(1, DB_CONNECT_ATTEMPTS)):
+            try:
+                raw = pymysql.connect(**DB_CONFIG)
+                if attempt:
+                    print(f"✅ Database connected on attempt {attempt + 1}")
+                break
+            except Exception as e:
+                last_error = e
+                raw = None
+                # Don't sleep after the last attempt — nobody is waiting on it.
+                if attempt + 1 < max(1, DB_CONNECT_ATTEMPTS):
+                    time.sleep(DB_CONNECT_BACKOFF * (2 ** attempt))
+
+        if raw is None:
+            print(f"❌ Database connection error after {max(1, DB_CONNECT_ATTEMPTS)} "
+                  f"attempts: {last_error}")
             raise HTTPException(status_code=500, detail="Database connection failed")
 
     return _PooledConn(raw)
