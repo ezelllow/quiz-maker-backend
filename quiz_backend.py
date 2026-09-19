@@ -6536,13 +6536,72 @@ except Exception as _ee:
 # FAULT REPORTS
 # ============================================================================
 
-# Optional. Set to a Discord / Slack incoming-webhook URL (or any endpoint
-# that accepts {"content": "..."}) to be told when a report lands. Left unset,
-# reports are simply stored — which is the point: the row is the record, the
-# notification is a nudge, and losing the nudge loses nothing.
+# Optional notification. Unset, reports are simply stored — which is the
+# point: the row is the record, the notification is a nudge, and losing the
+# nudge loses nothing.
+#
+# Telegram takes precedence when both are configured.
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  -> sendMessage
+#   REPORT_WEBHOOK_URL                     -> Discord / Slack incoming webhook
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 REPORT_WEBHOOK_URL = os.getenv('REPORT_WEBHOOK_URL', '').strip()
 
 REPORT_MAX_CHARS = 1000
+# Telegram rejects anything over 4096; ours are capped well under that, but a
+# rejected send would be a silently lost nudge, so clamp rather than trust.
+TELEGRAM_MAX_CHARS = 4000
+
+
+def _post_json(url: str, payload: dict) -> None:
+    """POST JSON with the standard library.
+
+    urllib, not `requests`: the module-level `requests` in this file is
+    google.auth.transport.requests, and the HTTP library is only a transitive
+    dependency (not in requirements.txt). stdlib avoids both traps.
+    """
+    import json as _json
+    import urllib.request as _urlreq
+
+    body = _json.dumps(payload).encode("utf-8")
+    post = _urlreq.Request(url, data=body, method="POST",
+                           headers={"Content-Type": "application/json"})
+    with _urlreq.urlopen(post, timeout=5):
+        pass
+
+
+def _send_telegram(text: str) -> None:
+    """One message to the configured chat.
+
+    Sent as PLAIN TEXT on purpose — no parse_mode. The body carries text a
+    student typed, and a stray _ or * in it would make Telegram reject the
+    whole message as malformed Markdown, losing the notification over a
+    formatting character.
+    """
+    _post_json(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        {"chat_id": TELEGRAM_CHAT_ID,
+         "text": text[:TELEGRAM_MAX_CHARS],
+         "disable_web_page_preview": True},
+    )
+
+
+def notify_text(text: str) -> bool:
+    """Send a notification wherever this deployment is pointed.
+
+    Returns whether anything was configured to send. Raises on a transport
+    failure so the caller can decide — notify_report swallows, the teacher's
+    test endpoint reports it.
+    """
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        _send_telegram(text)
+        return True
+    if REPORT_WEBHOOK_URL:
+        # Discord reads "content", Slack reads "text"; sending both means one
+        # env var works for either without a second setting to get wrong.
+        _post_json(REPORT_WEBHOOK_URL, {"content": text, "text": text})
+        return True
+    return False
 
 
 class ReportRequest(BaseModel):
@@ -6562,27 +6621,15 @@ class ReportRequest(BaseModel):
 
 def notify_report(report_id: int, who: str, req: "ReportRequest") -> None:
     """Best-effort ping. Runs in a background task AFTER the row is committed,
-    swallows everything: a student's report must succeed even when the
-    webhook is down, and the row is already safe either way."""
-    if not REPORT_WEBHOOK_URL:
-        return
+    and swallows everything: a student's report must succeed even when the
+    notifier is down, and the row is already safe either way."""
     try:
-        # urllib, not `requests`: the module-level `requests` in this file is
-        # google.auth.transport.requests, and the HTTP library is only a
-        # transitive dependency (not in requirements.txt). stdlib avoids both.
-        import json as _json
-        import urllib.request as _urlreq
-
         where = " · ".join(x for x in (req.content_uid, req.content_ref, req.subject) if x)
         body = f"🐞 Report #{report_id}" + (f" — {where}" if where else "")
         body += f"\n{(req.message or '').strip()}\n— {who}"
-        payload = _json.dumps({"content": body, "text": body}).encode("utf-8")
-        post = _urlreq.Request(REPORT_WEBHOOK_URL, data=payload, method="POST",
-                               headers={"Content-Type": "application/json"})
-        with _urlreq.urlopen(post, timeout=5):
-            pass
+        notify_text(body)
     except Exception as exc:
-        print(f"⚠️  Report webhook failed (non-fatal): {exc}")
+        print(f"⚠️  Report notification failed (non-fatal): {exc}")
 
 
 @app.post("/api/reports")
@@ -6648,6 +6695,30 @@ def list_reports(authorization: str = Header(None), limit: int = 100):
         "attempt_id": r[4], "screen": r[5], "message": r[6],
         "created_at": str(r[7]), "student": r[8], "student_class": r[9],
     } for r in rows]}
+
+
+@app.post("/api/teacher/reports/test-notify")
+def test_notify(authorization: str = Header(None)):
+    """Send a test notification, so setup can be confirmed without filing a
+    fake report. Unlike the real path this does NOT swallow failures — the
+    whole point is to see what went wrong."""
+    require_teacher(authorization)
+    channel = ("Telegram" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+               else "webhook" if REPORT_WEBHOOK_URL else None)
+    if not channel:
+        raise HTTPException(
+            status_code=400,
+            detail="No notifier configured. Set TELEGRAM_BOT_TOKEN and "
+                   "TELEGRAM_CHAT_ID (or REPORT_WEBHOOK_URL) and restart.",
+        )
+    try:
+        notify_text("✅ Ooka notifications are working. Student fault reports "
+                    "will arrive here.")
+    except Exception as exc:
+        # Surfaced verbatim: Telegram's own error text ("chat not found",
+        # "Unauthorized") is what actually tells you which value is wrong.
+        raise HTTPException(status_code=502, detail=f"{channel} send failed: {exc}")
+    return {"success": True, "channel": channel}
 
 
 @app.delete("/api/teacher/reports/{report_id}")
